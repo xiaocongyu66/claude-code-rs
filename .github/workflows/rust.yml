@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install huacnlee/cargo fork
+        # Cargo fork: shared, auto-trimmed build dir instead of ./target
+        run: curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh -s -- --no-guard
+
+      - name: Show cargo version
+        run: cargo --version && rustc --version
+
+      - name: cargo fmt --check
+        # Non-blocking while the rewrite is in flux.
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: cargo test
+        run: cargo test --release
+
+      - name: smoke --version
+        run: cargo run --release --quiet -- --version
