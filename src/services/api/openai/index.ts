@@ -1,0 +1,790 @@
+import type {
+  BetaToolUnion,
+  BetaMessage,
+  BetaUsage,
+  BetaRawMessageStreamEvent,
+} from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+import type { ChatCompletionChunk } from 'openai/resources/chat/completions/completions.mjs'
+import type { SystemPrompt } from '../../../utils/systemPromptType.js'
+import type {
+  Message,
+  StreamEvent,
+  SystemAPIErrorMessage,
+  AssistantMessage,
+  UserMessage,
+} from '../../../types/message.js'
+import type { AgentId } from '../../../types/ids.js'
+import type { Tools } from '../../../Tool.js'
+import { getSessionId } from '../../../bootstrap/state.js'
+import { withConnectionRetry } from 'src/services/api/connectionRetry.js'
+import type { ConnectionRetryStatus } from 'src/services/api/connectionRetry.js'
+import { retryStatusMessage } from 'src/services/api/connectionRetry.js'
+import {
+  releaseOnStreamEnd,
+  withProviderSlot,
+} from 'src/services/api/providerConcurrency.js'
+import { getOpenAIClient } from './client.js'
+import { createStreamWatchdog, type StreamWatchdog } from './streamWatchdog.js'
+import {
+  formatOpenAIPromptCacheKey,
+  getOfficialOpenAIPromptCacheKey,
+  updateOpenAIUsage,
+} from './openaiShared.js'
+import {
+  anthropicMessagesToOpenAI,
+  resolveOpenAIModel,
+  adaptOpenAIStreamToAnthropic,
+  anthropicToolsToOpenAI,
+  anthropicToolChoiceToOpenAI,
+} from '@ant/model-provider'
+import { isChatGPTAuthEnabled } from './chatgptAuth.js'
+import {
+  adaptResponsesStreamToAnthropic,
+  buildResponsesRequest,
+  createChatGPTResponsesStream,
+  invalidateCachedCodexClient,
+  type ResponsesReasoningEffort,
+} from './responsesAdapter.js'
+import { normalizeMessagesForAPI } from '../../../utils/messages.js'
+import { toolToAPISchema } from '../../../utils/api.js'
+import {
+  getEmptyToolPermissionContext,
+  toolMatchesName,
+} from '../../../Tool.js'
+import { logForDebugging } from '../../../utils/debug.js'
+import { addToTotalSessionCost } from '../../../cost-tracker.js'
+import { calculateUSDCost } from '../../../utils/modelCost.js'
+import {
+  isOpenAIThinkingEnabled,
+  resolveOpenAIMaxTokens,
+  buildOpenAIRequestBody,
+} from './requestBody.js'
+import { recordLLMObservation } from '../../../services/langfuse/tracing.js'
+import {
+  convertMessagesToLangfuse,
+  convertOutputToLangfuse,
+  convertToolsToLangfuse,
+} from '../../../services/langfuse/convert.js'
+export {
+  isOpenAIThinkingEnabled,
+  resolveOpenAIMaxTokens,
+  buildOpenAIRequestBody,
+}
+import { getModelMaxOutputTokens } from '../../../utils/context.js'
+import type { Options } from '../claude.js'
+import { randomUUID } from 'crypto'
+import {
+  createAssistantAPIErrorMessage,
+  createUserMessage,
+  normalizeContentFromAPI,
+} from '../../../utils/messages.js'
+import type { SDKAssistantMessageError } from '../../../entrypoints/agentSdkTypes.js'
+import {
+  isSearchExtraToolsEnabled,
+  isDeferredToolsDeltaEnabled,
+} from '../../../utils/searchExtraTools.js'
+import {
+  formatDeferredToolLine,
+  isDeferredTool,
+  SEARCH_EXTRA_TOOLS_TOOL_NAME,
+} from '@claude-code-hardened/builtin-tools/tools/SearchExtraToolsTool/prompt.js'
+
+/**
+ * "Retrying-in" surfaces for the connection retry layer. The debug line
+ * keeps the historical trace; `retryStatusMessage` renders the official
+ * system/api_error row ("Retrying in Xs… (attempt n/N)"). Establishment
+ * retries happen before any stream event exists and the retry loop runs
+ * inside an awaited callback, so the generator cannot yield mid-await —
+ * each notice is buffered and replayed into the message stream right after
+ * the stream is secured (both the ChatGPT and chat-completions paths).
+ */
+function logRetryIn({
+  attempt,
+  maxRetries,
+  retryInMs,
+}: ConnectionRetryStatus): void {
+  logForDebugging(
+    `[OpenAI] Retrying-in ${Math.round(retryInMs / 100) / 10}s ` +
+      `(attempt ${attempt}/${maxRetries})`,
+  )
+}
+
+function collectRetryStatus(
+  notices: SystemAPIErrorMessage[],
+): (status: ConnectionRetryStatus) => void {
+  return status => {
+    logRetryIn(status)
+    notices.push(retryStatusMessage(status))
+  }
+}
+
+function convertToResponsesReasoningEffort(
+  effortValue: unknown,
+): ResponsesReasoningEffort | undefined {
+  if (effortValue === 'low') return 'low'
+  if (effortValue === 'medium') return 'medium'
+  if (effortValue === 'high') return 'high'
+  if (effortValue === 'xhigh') return 'xhigh'
+  if (effortValue === 'max') return 'max'
+  if (typeof effortValue === 'number') return 'high'
+  return undefined
+}
+
+function getChatGPTResponsesReasoningEffort(
+  effortValue: unknown,
+): ResponsesReasoningEffort | undefined {
+  const envOverride = process.env.CLAUDE_CODE_EFFORT_LEVEL?.toLowerCase()
+  if (envOverride === 'auto' || envOverride === 'unset') return undefined
+  return (
+    convertToResponsesReasoningEffort(envOverride) ??
+    convertToResponsesReasoningEffort(effortValue) ??
+    'medium'
+  )
+}
+
+/**
+ * Mirrors the Anthropic request path's deferred-tool announcement for OpenAI.
+ *
+ * OpenAI-compatible endpoints cannot consume Anthropic's `defer_loading` or
+ * `tool_reference` beta payloads directly, so the model needs the same textual
+ * list of deferred MCP tool names that Anthropic receives before it can ask
+ * SearchExtraToolsTool to load their full schemas.
+ */
+function prependDeferredToolListIfNeeded(
+  messages: (AssistantMessage | UserMessage)[],
+  tools: Tools,
+  deferredToolNames: Set<string>,
+  useSearchExtraTools: boolean,
+): (AssistantMessage | UserMessage)[] {
+  if (!useSearchExtraTools || isDeferredToolsDeltaEnabled()) return messages
+
+  const deferredToolList = tools
+    .filter(tool => deferredToolNames.has(tool.name))
+    .map(formatDeferredToolLine)
+    .sort()
+    .join('\n')
+
+  if (!deferredToolList) return messages
+
+  return [
+    createUserMessage({
+      content: `<available-deferred-tools>\n${deferredToolList}\n</available-deferred-tools>`,
+      isMeta: true,
+    }),
+    ...messages,
+  ]
+}
+
+function isOpenAIConvertibleMessage(
+  msg: Message,
+): msg is AssistantMessage | UserMessage {
+  return msg.type === 'assistant' || msg.type === 'user'
+}
+
+/**
+ * Assemble the final AssistantMessage (and optional max_tokens error) from
+ * accumulated stream state. Extracted to avoid duplication between the
+ * `message_stop` handler and the post-loop safety fallback.
+ */
+function assembleFinalAssistantOutputs(params: {
+  partialMessage: BetaMessage | null
+  contentBlocks: Record<number, Record<string, unknown>>
+  tools: Tools
+  agentId: string | undefined
+  usage: {
+    input_tokens: number
+    output_tokens: number
+    cache_creation_input_tokens: number
+    cache_read_input_tokens: number
+  }
+  stopReason: string | null
+  maxTokens: number
+}): (AssistantMessage | SystemAPIErrorMessage)[] {
+  const {
+    partialMessage,
+    contentBlocks,
+    tools,
+    agentId,
+    usage,
+    stopReason,
+    maxTokens,
+  } = params
+  const outputs: (AssistantMessage | SystemAPIErrorMessage)[] = []
+
+  const allBlocks = Object.keys(contentBlocks)
+    .sort((a, b) => Number(a) - Number(b))
+    .map(k => contentBlocks[Number(k)])
+    .filter(Boolean)
+
+  if (allBlocks.length > 0 && partialMessage) {
+    outputs.push({
+      message: {
+        ...partialMessage,
+        content: normalizeContentFromAPI(
+          allBlocks as unknown as BetaMessage['content'],
+          tools,
+          agentId as AgentId | undefined,
+        ),
+        usage,
+        stop_reason: stopReason,
+        stop_sequence: null,
+      } as AssistantMessage['message'],
+      requestId: undefined,
+      type: 'assistant',
+      uuid: randomUUID(),
+      timestamp: new Date().toISOString(),
+    } as AssistantMessage)
+  }
+
+  if (stopReason === 'max_tokens') {
+    outputs.push(
+      createAssistantAPIErrorMessage({
+        content:
+          `Output truncated: response exceeded the ${maxTokens} token limit. ` +
+          `Set OPENAI_MAX_TOKENS or CLAUDE_CODE_MAX_OUTPUT_TOKENS to override.`,
+        apiError: 'max_output_tokens',
+        error: 'max_output_tokens',
+      }),
+    )
+  }
+
+  return outputs
+}
+
+/**
+ * OpenAI-compatible query path. Converts Anthropic-format messages/tools to
+ * OpenAI format, calls the OpenAI-compatible endpoint, and converts the
+ * SSE stream back to Anthropic BetaRawMessageStreamEvent for consumption
+ * by the existing query pipeline.
+ */
+export async function* queryModelOpenAI(
+  messages: Message[],
+  systemPrompt: SystemPrompt,
+  tools: Tools,
+  signal: AbortSignal,
+  options: Options,
+): AsyncGenerator<
+  StreamEvent | AssistantMessage | SystemAPIErrorMessage,
+  void
+> {
+  try {
+    // 1. Resolve model name
+    const openaiModel = resolveOpenAIModel(options.model)
+
+    // 2. Normalize messages using shared preprocessing
+    const messagesForAPI = normalizeMessagesForAPI(messages, tools)
+
+    // 3. Check if tool search is enabled (similar to Anthropic path)
+    const useSearchExtraTools = await isSearchExtraToolsEnabled(
+      options.model,
+      tools,
+      options.getToolPermissionContext ||
+        (async () => getEmptyToolPermissionContext()),
+      options.agents || [],
+      options.querySource,
+    )
+
+    // 4. Build deferred tools set (similar to Anthropic path)
+    const deferredToolNames = new Set<string>()
+    if (useSearchExtraTools) {
+      for (const t of tools) {
+        if (isDeferredTool(t)) deferredToolNames.add(t.name)
+      }
+    }
+
+    // 5. Filter tools (similar to Anthropic path)
+    // Never include deferred tools in the API tools array — they are invoked
+    // via ExecuteExtraTool which looks them up from the global tool registry
+    // at runtime. Keeping the tools array stable preserves the prompt cache.
+    let filteredTools = tools
+    if (useSearchExtraTools && deferredToolNames.size > 0) {
+      filteredTools = tools.filter(tool => {
+        // Always include non-deferred tools
+        if (!deferredToolNames.has(tool.name)) return true
+        // Always include SearchExtraToolsTool (so it can discover more tools)
+        if (toolMatchesName(tool, SEARCH_EXTRA_TOOLS_TOOL_NAME)) return true
+        // All other deferred tools are excluded — use ExecuteExtraTool instead
+        return false
+      })
+    }
+
+    // 6. Build tool schemas with deferLoading flag
+    const toolSchemas = await Promise.all(
+      filteredTools.map(tool =>
+        toolToAPISchema(tool, {
+          getToolPermissionContext: options.getToolPermissionContext,
+          tools,
+          agents: options.agents,
+          allowedAgentTypes: options.allowedAgentTypes,
+          model: options.model,
+          deferLoading: useSearchExtraTools && deferredToolNames.has(tool.name),
+        }),
+      ),
+    )
+
+    // 7. Filter out non-standard tools (server tools like advisor)
+    const standardTools: BetaToolUnion[] = toolSchemas.filter(
+      (t): t is BetaToolUnion & { type: string } => {
+        const anyT = t as unknown as Record<string, unknown>
+        return (
+          anyT.type !== 'advisor_20260301' && anyT.type !== 'computer_20250124'
+        )
+      },
+    )
+
+    // 8. Convert messages and tools to OpenAI format
+    const enableThinking = isOpenAIThinkingEnabled(openaiModel)
+    const openAIConvertibleMessages = messagesForAPI.filter(
+      isOpenAIConvertibleMessage,
+    )
+    const messagesWithDeferredToolList = prependDeferredToolListIfNeeded(
+      openAIConvertibleMessages,
+      tools,
+      deferredToolNames,
+      useSearchExtraTools,
+    )
+    const openaiMessages = anthropicMessagesToOpenAI(
+      messagesWithDeferredToolList,
+      systemPrompt,
+      { enableThinking },
+    )
+    const openaiTools = anthropicToolsToOpenAI(standardTools)
+    const openaiToolChoice = anthropicToolChoiceToOpenAI(options.toolChoice)
+    const reasoningEffort = getChatGPTResponsesReasoningEffort(
+      options.effortValue,
+    )
+
+    // 9. Log tool filtering details
+    if (useSearchExtraTools) {
+      const includedDeferredTools = filteredTools.filter(t =>
+        deferredToolNames.has(t.name),
+      ).length
+      logForDebugging(
+        `[OpenAI] Tool search enabled: ${includedDeferredTools}/${deferredToolNames.size} deferred tools included, total tools=${openaiTools.length}`,
+      )
+    } else {
+      logForDebugging(
+        `[OpenAI] Tool search disabled, total tools=${openaiTools.length}`,
+      )
+    }
+
+    // 10. Compute max_tokens — required by most OpenAI-compatible endpoints.
+    //     Without this the server uses a tiny default, and when
+    //     thinking is enabled the thinking phase consumes the entire budget
+    //     leaving no tokens for the final response.
+    //
+    //     Use upperLimit (not the slot-cap default) because the Anthropic path's
+    //     slot-reservation cap (CAPPED_DEFAULT_MAX_TOKENS=8k) is paired with an
+    //     auto-retry at 64k in query.ts. The OpenAI path has no such retry, so
+    //     using the capped 8k default would silently truncate responses in
+    //     multi-turn conversations where thinking consumes most of the budget.
+    //
+    //     Override priority:
+    //     1. options.maxOutputTokensOverride (programmatic)
+    //     2. OPENAI_MAX_TOKENS env var (OpenAI-specific, useful for local models
+    //        with small context windows, e.g. RTX 3060 12GB running 65536-token models)
+    //     3. CLAUDE_CODE_MAX_OUTPUT_TOKENS env var (generic override)
+    //     4. upperLimit default (64000)
+    const { upperLimit } = getModelMaxOutputTokens(openaiModel)
+    const maxTokens = resolveOpenAIMaxTokens(
+      upperLimit,
+      options.maxOutputTokensOverride,
+    )
+
+    const useChatGPTResponses = isChatGPTAuthEnabled()
+    // OpenAI's official OAuth and API-key routes share the same prompt-cache
+    // contract. Scope the key to the real conversation so resumed turns stay
+    // sticky while unrelated sessions do not share a routing bucket. Generic
+    // compatible endpoints intentionally receive no OpenAI-specific fields.
+    const sessionId = getSessionId()
+    const sessionPromptCacheKey = formatOpenAIPromptCacheKey(sessionId)
+    const promptCacheKey = useChatGPTResponses
+      ? sessionPromptCacheKey
+      : getOfficialOpenAIPromptCacheKey(process.env.OPENAI_BASE_URL, sessionId)
+    const useOfficialOpenAICache = promptCacheKey !== undefined
+
+    logForDebugging(
+      `[OpenAI] Calling model=${openaiModel}, messages=${openaiMessages.length}, tools=${openaiTools.length}, thinking=${enableThinking}${promptCacheKey ? `, prompt_cache_key=${promptCacheKey}` : ''}`,
+    )
+
+    // 11. Call OpenAI API with streaming. ChatGPT subscription auth uses the
+    // Codex Responses backend; API-key/OpenAI-compatible auth keeps the
+    // existing Chat Completions adapter.
+    //
+    // Both paths are served by the official OpenAI SDK (no hand-rolled
+    // fetch/SSE lives in this layer). The client runs with a 600s
+    // total-duration timeout (covers headers only — the SDK never caps a
+    // streaming body) and
+    // maxRetries: 0 (retry ownership belongs to QueryEngine's fallback state
+    // machine). Stalled streams are guarded by the silence-based idle
+    // watchdog: its signal replaces the raw one in create() and the upstream
+    // abort signal stays linked through it.
+    let adaptedStream: AsyncGenerator<BetaRawMessageStreamEvent, void>
+    // Replay-window teardown handles (see the TEARDOWN GUARD below). A
+    // suspendedStart async generator's return() runs NO body finallys, so
+    // when consumption never started the releaseOnStreamEnd chain cannot
+    // unwind itself — the slot release and the per-attempt watchdog must be
+    // captured here and torn down explicitly by the guard.
+    let slotRelease: (() => void) | undefined
+    let inFlightWatchdog: StreamWatchdog | undefined
+    let disposeResponses: (() => void) | undefined
+    // Establishment-retry notices (official g0 payloads) buffered during the
+    // awaited retry loops (both paths), replayed into the message stream once
+    // the stream is secured.
+    const retryNotices: SystemAPIErrorMessage[] = []
+    // W2.12 flush 面：establishment 终抛（budget 已尽 / RetryAfterTooLong /
+    // user abort）时把缓冲的 "Retrying in Xs…" 行先落为 system 消息再让
+    // 终错逃逸——丢弃窗口里的重试史对用户不可见曾是静默面（官方 g0 行的
+    // 回放不因终态丢失）。
+    try {
+      if (useChatGPTResponses) {
+        // Establishment-only connection retry (official SDK semantics —
+        // connection-class failures retry, mid-stream errors never do).
+        // Provider-concurrency slot: acquired before the request goes out,
+        // held until the stream settles (releaseOnStreamEnd finally — the
+        // same teardown instant as the watchdog's settle inside the adapter).
+        adaptedStream = await withProviderSlot(
+          'openai',
+          async release => {
+            slotRelease = release
+            const stream = await withConnectionRetry(
+              () =>
+                createChatGPTResponsesStream({
+                  request: buildResponsesRequest({
+                    model: openaiModel,
+                    messages: openaiMessages,
+                    tools: openaiTools,
+                    toolChoice: openaiToolChoice,
+                    reasoningEffort,
+                    promptCacheKey: sessionPromptCacheKey,
+                  }),
+                  signal,
+                  fetchOverride:
+                    options.fetchOverride as unknown as typeof fetch,
+                }),
+              {
+                signal,
+                source: options.querySource,
+                onRetryStatus: collectRetryStatus(retryNotices),
+                // W2.11 per-request usedTokenCache 标记（0032:706 shouldRetry
+                // 401 门）：codex establishment 面每次经 getValidChatGPTAuth()
+                // 从 ChatGPT 凭据缓存取 token → 恒置位；401 刷新前走
+                // invalidate 面（丢 cached codex client，凭据键重读）。
+                usedTokenCache: () => true,
+                invalidateTokenCache: invalidateCachedCodexClient,
+              },
+            )
+            disposeResponses = stream.dispose
+            return releaseOnStreamEnd(
+              adaptResponsesStreamToAnthropic(stream, openaiModel),
+              release,
+            )
+          },
+          signal,
+        )
+      } else {
+        // maxRetries 不再在构造面下达（官方 0032:706 `o=s.maxRetries??
+        // this.maxRetries` 每请求覆盖语义）：共享缓存 client 恒以
+        // maxRetries:0 构造，主循环重试所有权在 QueryEngine。
+        const client = getOpenAIClient({
+          fetchOverride: options.fetchOverride as unknown as typeof fetch,
+          source: options.querySource,
+        })
+        // Establishment-only connection retry with a per-attempt watchdog
+        // (official SDK semantics). A stalled attempt aborts through its own
+        // watchdog signal; the retry gets a fresh one, so an idle-fired
+        // watchdog cannot poison the next attempt.
+        // Provider-concurrency slot: acquired before the request goes out and
+        // released when the adapted stream settles (watchdog.wrap's settle
+        // fires one hop later in the same teardown chain).
+        adaptedStream = await withProviderSlot(
+          'openai',
+          async release => {
+            slotRelease = release
+            const { rawStream, watchdog } = await withConnectionRetry(
+              async () => {
+                const watchdog = createStreamWatchdog({
+                  url: `${(
+                    client.baseURL ?? 'https://api.openai.com/v1'
+                  ).replace(/\/+$/, '')}/chat/completions`,
+                  model: openaiModel,
+                  externalSignal: signal,
+                })
+                // Capture for the replay-window teardown guard (see below).
+                inFlightWatchdog = watchdog
+                try {
+                  const rawStream = await client.chat.completions.create(
+                    buildOpenAIRequestBody({
+                      model: openaiModel,
+                      messages: openaiMessages,
+                      tools: openaiTools,
+                      toolChoice: openaiToolChoice,
+                      enableThinking,
+                      maxTokens,
+                      temperatureOverride: options.temperatureOverride,
+                      promptCacheKey,
+                    }),
+                    { signal: watchdog.signal },
+                  )
+                  // Establishment succeeded — disarm the first-byte window before
+                  // the consumption loop re-arms the idle window.
+                  watchdog.markEstablished()
+                  return { rawStream, watchdog }
+                } catch (error) {
+                  // The stream was never handed out — the wrap cannot settle the
+                  // in-flight registry on our behalf.
+                  watchdog.settle()
+                  throw error
+                }
+              },
+              {
+                signal,
+                source: options.querySource,
+                onRetryStatus: collectRetryStatus(retryNotices),
+              },
+            )
+            return releaseOnStreamEnd(
+              adaptOpenAIStreamToAnthropic(
+                watchdog.wrap(rawStream),
+                openaiModel,
+                { includeCacheWriteTokens: useOfficialOpenAICache },
+              ),
+              release,
+            )
+          },
+          signal,
+        )
+      }
+    } catch (establishmentError) {
+      for (const notice of retryNotices) yield notice
+      retryNotices.length = 0
+      throw establishmentError
+    }
+
+    // The stream is secured — replay the buffered establishment-retry rows
+    // (official g0 face) so the user sees the retry history in-stream.
+    //
+    // TEARDOWN GUARD (#31 residual orphan window): these yields suspend the
+    // generator AFTER `adaptedStream` exists but BEFORE the for-await below
+    // takes over its teardown. for-await's abrupt-completion protocol only
+    // closes the inner iterator for yields INSIDE its body, so a consumer
+    // .return() at a replay yield would unwind with NO enclosing finally
+    // reaching the stream: withProviderSlot's release never fires (provider
+    // concurrency slot leaks), watchdog.settle() never runs (in-flight
+    // registry + raw HTTP body leak). The establishment catch above is safe
+    // (adaptedStream not yet assigned), and yields inside/after the for-await
+    // are covered by its own protocol — the replay loop is the only
+    // unprotected suspension window.
+    //
+    // Generator-return alone CANNOT be the fix here: adaptedStream was never
+    // iterated at this point (suspendedStart), and per generator semantics a
+    // return() on a not-yet-started generator executes NO body finallys —
+    // releaseOnStreamEnd's release would still never fire. The teardown
+    // therefore uses the explicitly captured handles (slotRelease,
+    // inFlightWatchdog): abort kills the underlying HTTP request through the
+    // watchdog controller and settles the registry; slotRelease frees the
+    // concurrency slot. Both are idempotent, so the normal path (replayed)
+    // and a later releaseOnStreamEnd unwinding compose safely. The fire and
+    // forget adaptedStream.return() stays as a belt-and-braces close for any
+    // already-started chain; a second return() on a settled generator is a
+    // no-op. Codex exposes its watchdog teardown through an explicit dispose
+    // handle: markEstablished has already disarmed its first-byte timer.
+    let replayed = false
+    try {
+      for (const notice of retryNotices) yield notice
+      replayed = true
+    } finally {
+      if (!replayed) {
+        disposeResponses?.()
+        inFlightWatchdog?.abort(
+          new Error(
+            'OpenAI stream abandoned before consumption (replay-window teardown)',
+          ),
+        )
+        slotRelease?.()
+        void adaptedStream?.return?.().catch(() => {})
+      }
+    }
+    retryNotices.length = 0
+
+    // 12. Convert OpenAI stream to Anthropic events, then process into
+    //     AssistantMessage + StreamEvent (matching the Anthropic path behavior)
+
+    // Accumulate content blocks and usage, same as the Anthropic path in claude.ts
+    const contentBlocks: Record<number, Record<string, unknown>> = {}
+    const textDeltas = new Map<number, string[]>()
+    const collectedMessages: AssistantMessage[] = []
+    let partialMessage: BetaMessage | null = null
+    let stopReason: string | null = null
+    let usage = {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    }
+    let ttftMs = 0
+    const start = Date.now()
+
+    for await (const event of adaptedStream) {
+      switch (event.type) {
+        case 'message_start': {
+          partialMessage = event.message
+          ttftMs = Date.now() - start
+          if (event.message.usage) {
+            usage = {
+              ...usage,
+              ...(event.message.usage as unknown as typeof usage),
+            }
+          }
+          break
+        }
+        case 'content_block_start': {
+          const idx = event.index
+          const cb = event.content_block
+          if (cb.type === 'tool_use') {
+            contentBlocks[idx] = { ...cb, input: '' }
+          } else if (cb.type === 'text') {
+            contentBlocks[idx] = { ...cb, text: '' }
+            textDeltas.set(idx, [])
+          } else if (cb.type === 'thinking') {
+            contentBlocks[idx] = { ...cb, thinking: '', signature: '' }
+          } else {
+            contentBlocks[idx] = { ...cb }
+          }
+          break
+        }
+        case 'content_block_delta': {
+          const idx = event.index
+          const delta = event.delta
+          const block = contentBlocks[idx]
+          if (!block) break
+          if (delta.type === 'text_delta') {
+            textDeltas.get(idx)?.push(delta.text)
+          } else if (delta.type === 'input_json_delta') {
+            block.input =
+              ((block.input as string | undefined) || '') + delta.partial_json
+          } else if (delta.type === 'thinking_delta') {
+            block.thinking =
+              ((block.thinking as string | undefined) || '') + delta.thinking
+          } else if (delta.type === 'signature_delta') {
+            block.signature = delta.signature
+          }
+          break
+        }
+        case 'content_block_stop': {
+          const deltas = textDeltas.get(event.index)
+          if (deltas) {
+            const block = contentBlocks[event.index]
+            if (block && block.type === 'text') {
+              block.text = deltas.join('')
+            }
+            textDeltas.delete(event.index)
+          }
+          // Block accumulation is complete; assembly happens at message_stop.
+          break
+        }
+        case 'message_delta': {
+          const deltaUsage = event.usage
+          if (deltaUsage) {
+            usage = updateOpenAIUsage(
+              usage,
+              deltaUsage as unknown as Parameters<typeof updateOpenAIUsage>[1],
+            )
+          }
+          if (event.delta.stop_reason != null) {
+            stopReason = event.delta.stop_reason
+          }
+          break
+        }
+        case 'message_stop': {
+          // Assemble ONE AssistantMessage with ALL content blocks, matching the
+          // Anthropic SDK path. Real usage (input + output tokens) is available
+          // here and injected so tokenCountWithEstimation() can read it.
+          if (partialMessage) {
+            for (const output of assembleFinalAssistantOutputs({
+              partialMessage,
+              contentBlocks,
+              tools,
+              agentId: options.agentId,
+              usage,
+              stopReason,
+              maxTokens,
+            })) {
+              if (output.type === 'assistant') {
+                collectedMessages.push(output)
+              }
+              yield output
+            }
+            // Reset partialMessage so the post-loop safety fallback does not
+            // yield a second identical AssistantMessage.
+            partialMessage = null
+          }
+          // Track cost and token usage
+          if (usage.input_tokens + usage.output_tokens > 0) {
+            const costUSD = calculateUSDCost(
+              openaiModel,
+              usage as unknown as BetaUsage,
+            )
+            addToTotalSessionCost(
+              costUSD,
+              usage as unknown as BetaUsage,
+              options.model,
+            )
+          }
+          break
+        }
+      }
+
+      // Also yield as StreamEvent for real-time display (matching Anthropic path)
+      yield {
+        type: 'stream_event',
+        event,
+        ...(event.type === 'message_start' ? { ttftMs } : undefined),
+      } as StreamEvent
+    }
+
+    // Record LLM observation in Langfuse (no-op if not configured)
+    recordLLMObservation(options.langfuseTrace ?? null, {
+      model: openaiModel,
+      provider: 'openai',
+      input: convertMessagesToLangfuse(openaiMessages),
+      output: convertOutputToLangfuse(collectedMessages),
+      usage: {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+      },
+      startTime: new Date(start),
+      endTime: new Date(),
+      completionStartTime: ttftMs > 0 ? new Date(start + ttftMs) : undefined,
+      tools: convertToolsToLangfuse(toolSchemas as unknown[]),
+      ...(enableThinking && { thinking: { type: 'enabled' } }),
+    })
+
+    // Safety: if stream ended without message_stop, assemble and yield whatever we have
+    if (partialMessage) {
+      for (const output of assembleFinalAssistantOutputs({
+        partialMessage,
+        contentBlocks,
+        tools,
+        agentId: options.agentId,
+        usage,
+        stopReason,
+        maxTokens,
+      })) {
+        yield output
+      }
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    logForDebugging(`[OpenAI] Error: ${errorMessage}`, { level: 'error' })
+    yield createAssistantAPIErrorMessage({
+      content: `API Error: ${errorMessage}`,
+      apiError: 'api_error',
+      error: (error instanceof Error
+        ? error
+        : new Error(String(error))) as unknown as SDKAssistantMessageError,
+    })
+  }
+}

@@ -1,0 +1,348 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/*", "feat/*", "perf/*"]
+  pull_request:
+    branches: [main, "feat/*", "perf/*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── TS 质量：lint + typecheck + test ──
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, 2026-04-25
+        env:
+          GIT_CONFIG_COUNT: 2
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
+          GIT_CONFIG_KEY_1: advice.defaultBranchName
+          GIT_CONFIG_VALUE_1: "false"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2, 2026-04-25
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        env:
+          CLAUDE_CODE_SKIP_CHROME_MCP_SETUP: "1"
+        run: bun install --frozen-lockfile
+
+      - name: Lint and format check
+        run: bunx biome ci .
+
+      - name: Type check
+        run: bun run typecheck
+
+      - name: Ink P0 contract tests
+        run: |
+          bun test ./packages/@ant/ink/src/core/__tests__/
+          bun test ./scripts/bench-ink.test.ts
+
+      - name: Ink P0 microbenchmarks
+        timeout-minutes: 5
+        env:
+          TERM: xterm-256color
+          LANG: C.UTF-8
+          LC_ALL: C.UTF-8
+          TZ: UTC
+          CLAUDE_CODE_LEGACY_CONSOLE: "0"
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/ink-p0"
+          mkdir -p "$out"
+          status=0
+          for run in 1 2 3; do
+            if bun scripts/bench-ink.ts --mode all --width 80 --height 24 --nodes 100 --warmup 10 --samples 50 > "$out/bench-$run.jsonl" 2> "$out/bench-$run.stderr.log"; then
+              :
+            else
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Ink P0 Linux PTY lifecycle
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ink-p0"
+          python3 scripts/ink-pty-baseline.py 2>&1 | tee "$RUNNER_TEMP/ink-p0/pty.log"
+
+      - name: Upload Ink P0 evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ink-p0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ink-p0/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Test with Coverage
+        run: |
+          # Tolerate pre-existing flaky tests (Bun mock pollution / order-dependent state).
+          # We still require lcov.info to be generated and contain real coverage data.
+          set -o pipefail
+          # Keep the per-file header lines: dropping them (the old sed) made
+          # load-time failures unattributable in the log.
+          bun test --coverage --coverage-reporter lcov --coverage-dir coverage 2>&1 | grep -vE '^\s*(\(pass\)|\(skip\))' | cat -s
+          test -s coverage/lcov.info
+          grep -q '^SF:' coverage/lcov.info
+
+  # ── Rust native：5 平台矩阵（产物供 package 打包内嵌）──
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64（GNU，链接 glibc —— 运行时与本仓库现有 native 产物一致）
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          # Linux ARM64（aarch64 服务器 / ARM 容器）
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          # macOS ARM64（Apple Silicon）
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # macOS x86_64 —— Intel macos-13 runner 容量枯竭长期排队；
+          # macos-14 (arm64) 交叉编译，macOS 通用 SDK 原生支持 -arch x86_64
+          - os: macos-14
+            target: x86_64-apple-darwin
+          # Windows x86_64（MSVC）
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          # Windows ARM64（MSVC ARM64 组件，windows-2022 镜像预装）
+          - os: windows-2022
+            target: aarch64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, 2026-04-25
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, pinned 2026-09-25
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Use MSVC ARM64 linker (win arm64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          # cargo 默认 PATH 里的 link.exe 是 x64 版，链 arm64 目标必挂——
+          # 插入 VS 预装的 HostX64/arm64（镜像含 VC.Tools.ARM64 组件）
+          $arm64Link = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022" -Recurse -Filter link.exe |
+            Where-Object { $_.FullName -like "*HostX64\arm64*" } | Select-Object -First 1
+          if (-not $arm64Link) { Write-Output "::error::MSVC ARM64 linker not found"; exit 1 }
+          echo "$(Split-Path $arm64Link.FullName)" >> $env:GITHUB_PATH
+
+      - name: Install cross-compilation tools (aarch64 linux)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build (token-counter)
+        working-directory: packages/token-counter-napi/native
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (transcript-parser)
+        if: hashFiles('packages/transcript-parser-napi/native/Cargo.toml') != ''
+        working-directory: packages/transcript-parser-napi/native
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (color-diff)
+        if: hashFiles('packages/color-diff-napi/native/Cargo.toml') != ''
+        working-directory: packages/color-diff-napi/native
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (file-index)
+        if: hashFiles('packages/file-index-napi/native/Cargo.toml') != ''
+        working-directory: packages/file-index-napi/native
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (search)
+        if: hashFiles('packages/search-napi/native/Cargo.toml') != ''
+        working-directory: packages/search-napi/native
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 统一整理产物到 vendor 布局：vendor/<name>/<triple>/<name>.node
+      - name: Stage artifacts (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "stage/token-counter/${{ matrix.target }}" "stage/transcript-parser/${{ matrix.target }}" "stage/color-diff/${{ matrix.target }}" "stage/file-index/${{ matrix.target }}" "stage/search/${{ matrix.target }}"
+          for name in token-counter transcript-parser color-diff file-index search; do
+            crate="${name//-/_}_napi"
+            src=""
+            for ext in so dylib; do
+              if [ -f "packages/$name-napi/native/target/${{ matrix.target }}/release/lib$crate.$ext" ]; then
+                src="packages/$name-napi/native/target/${{ matrix.target }}/release/lib$crate.$ext"
+                break
+              fi
+            done
+            if [ -z "$src" ]; then
+              echo "::error::native artifact missing: $name (${{ matrix.target }}) — build failed or output renamed"
+              exit 1
+            fi
+            cp "$src" "stage/$name/${{ matrix.target }}/$name.node"
+          done
+          find stage -type f
+
+      - name: Stage artifacts (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "stage/token-counter/${{ matrix.target }}", "stage/transcript-parser/${{ matrix.target }}", "stage/color-diff/${{ matrix.target }}", "stage/file-index/${{ matrix.target }}", "stage/search/${{ matrix.target }}" | Out-Null
+          foreach ($name in @('token-counter', 'transcript-parser', 'color-diff', 'file-index', 'search')) {
+            $crate = $name -replace '-', '_'
+            $src = "packages/$name-napi/native/target/${{ matrix.target }}/release/${crate}_napi.dll"
+            if (-not (Test-Path $src)) {
+              Write-Output "::error::native artifact missing: $name (${{ matrix.target }}) — build failed or output renamed"
+              exit 1
+            }
+            Copy-Item $src "stage/$name/${{ matrix.target }}/$name.node"
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.target }}
+          path: stage/
+          if-no-files-found: error
+
+  # ── 打包：native 产物只在工作区填充 vendor/（不入 git）+ 一条 CLI 出完整 claude code ──
+  # scripts/build-all.mjs 与本地全流程是同一个入口（本地不带 --skip-native
+  # 时自己跑 cargo 编译多平台）。CI 端 native 来自上面矩阵的 artifact——
+  # 每次构建都现场编译 Rust，保证产物永远对应当前源码；vendor/ 不再回写仓库。
+  # compile.ts 默认启用 JSC bytecode 预编译（--version 1.16s→0.20s，代价体积 +53%）。
+  package:
+    needs: [quality, native]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2, 2026-04-25
+        with:
+          fetch-depth: 0
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Sync artifacts into vendor/
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in artifacts/native-*; do
+            triple="${dir#artifacts/native-}"
+            for name in token-counter transcript-parser color-diff file-index search; do
+              if [ -d "$dir/$name/$triple" ]; then
+                mkdir -p "vendor/$name/$triple"
+                cp "$dir/$name/$triple/$name.node" "vendor/$name/$triple/"
+              fi
+            done
+          done
+          find vendor/token-counter vendor/transcript-parser vendor/color-diff vendor/file-index vendor/search -name '*.node' 2>/dev/null | sort
+          # 严格化断言：5 模块 × 6 triple，缺一即失败
+          MISSING=0
+          for name in token-counter transcript-parser color-diff file-index search; do
+            for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+              [ -f "vendor/$name/$triple/$name.node" ] || { echo "::error::vendor missing: $name/$triple"; MISSING=1; }
+            done
+          done
+          [ "$MISSING" = "0" ] || exit 1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2, 2026-04-25
+        with:
+          bun-version: 1.4.3
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: One-shot build (bundle + npm tarball)
+        run: node scripts/build-all.mjs --skip-native
+
+      # 产物架构断言：ELF 查 e_machine（offset 0x12），Mach-O 查 magic，PE 查 machine 字段。
+      # 此前 compile.targets 被 Bun 静默忽略，x86 host 曾把 arm64 名字编成 x86_64 ELF。
+      - name: Verify artifact architectures
+        run: |
+          check_elf() {
+            local file="$1" expect="$2"
+            local machine
+            machine=$(od -A n -t u1 -j 18 -N 2 "$file" | tr -s ' ' | sed 's/^ //')
+            [ "$machine" = "$expect" ] || { echo "  ✗ $file e_machine=$machine, expected $expect"; exit 1; }
+            echo "  ✓ $file (ELF e_machine=$machine)"
+          }
+          check_macho() {
+            local file="$1" expect="$2"  # cputype LE bytes, e.g. "12 0 0 1" = arm64
+            local magic
+            magic=$(od -A n -t x1 -N 4 "$file" | tr -d ' \n')
+            [ "$magic" = "cffaedfe" ] || { echo "  ✗ $file Mach-O magic=$magic, expected cffaedfe"; exit 1; }
+            local cputype
+            cputype=$(od -A n -t u1 -j 4 -N 4 "$file" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //;s/ $//')
+            [ "$cputype" = "$expect" ] || { echo "  ✗ $file cputype bytes=$cputype, expected $expect"; exit 1; }
+            echo "  ✓ $file (Mach-O cputype bytes=$cputype)"
+          }
+          check_pe() {
+            local file="$1"
+            local mz lf machine
+            mz=$(od -A n -t x1 -N 2 "$file" | tr -d ' ')
+            [ "$mz" = "4d5a" ] || { echo "  ✗ $file missing MZ signature"; exit 1; }
+            lf=$(od -A n -t u4 -j 60 -N 4 "$file" | tr -d ' ')
+            machine=$(od -A n -t u2 -j $((lf + 4)) -N 2 "$file" | tr -d ' ')
+            [ "$machine" = "34404" ] || { echo "  ✗ $file PE machine=$machine, expected 34404 (0x8664)"; exit 1; }
+            echo "  ✓ $file (PE machine=0x8664)"
+          }
+          check_elf dist/cch-linux-x64        "62 0"    # EM_X86_64
+          check_elf dist/cch-linux-arm64     "183 0"   # EM_AARCH64
+          check_macho dist/cch-darwin-x64     "7 0 0 1"    # x86_64 LE bytes (CPU_TYPE_X86_64 = 0x01000007)
+          check_macho dist/cch-darwin-arm64  "12 0 0 1"    # arm64 LE bytes
+          check_pe dist/cch-windows-x64.exe
+
+      # 产物运行时冒烟：--version 验证可执行；--check-commands 强制加载全部
+      # lazy shim——compile 下缺失模块曾以 "Cannot find module
+      # './commands/add-dir/index.js'" 崩溃 REPL（uncaught → 11s 清理 → exit 0），
+      # 在此处即失败。只跑 host 架构（linux-x64），其余平台由架构断言覆盖。
+      - name: Smoke test binary (linux-x64)
+        run: |
+          set -euo pipefail
+          chmod +x dist/cch-linux-x64
+          out=$(dist/cch-linux-x64 --version)
+          echo "  --version → $out"
+          dist/cch-linux-x64 --check-commands
+          echo "  ✓ --check-commands: all command shims loaded"
+
+      # 启动性能靶点（阈值级回归由 bench-startup.ts 本机判定；此处为打包期
+      # 可见性观测——CI 机器波动大不设毫秒阈值，但 probe 本身崩溃仍会使
+      # job 失败）：bytecode 预编译后 --version 应在 ~1s 内（A/B 实测
+      # 中位 0.20s vs 非 bytecode 1.16s）。回归时对比历史 run 日志可见。
+      - name: Startup perf probes (linux-x64)
+        run: |
+          set -euo pipefail
+          for probe in --version --check-commands; do
+            for i in 1 2 3; do
+              s=$(date +%s%N)
+              dist/cch-linux-x64 $probe > /dev/null 2>&1
+              e=$(date +%s%N)
+              echo "  probe[$probe] run$i: $(( (e-s)/1000000 ))ms"
+            done
+          done
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: claude-code-dist
+          path: dist/
+
+      - name: Upload npm tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: claude-code-npm
+          path: "*.tgz"
+          if-no-files-found: error

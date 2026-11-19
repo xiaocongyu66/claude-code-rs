@@ -1,0 +1,167 @@
+import { afterAll, describe, expect, mock, test } from 'bun:test'
+
+// Mock dependencies before import
+const mockCwd = '/Users/test/project'
+
+// 真实快照必须在 mock.module 工厂引用之前初始化：当 src/utils/cwd.js 已被
+// 同进程先前测试文件加载时，mock.module 会同步执行工厂，声明在后会撞 TDZ
+// （Cannot access 'realCwdSnapshotGS' before initialization）。
+import * as realCwdModuleGS from 'src/utils/cwd.js'
+const realCwdSnapshotGS: Record<string, unknown> = { ...realCwdModuleGS }
+
+// Complete cwd.js export set — mock.module is process-global and a partial
+// mock breaks unrelated files loaded later that import the other real named
+// exports (e.g. the R4 sandboxDecision tests pull the Bash decision chain,
+// which needs pwd()).
+mock.module('src/utils/cwd.js', () => ({
+  ...realCwdSnapshotGS,
+  runWithCwdOverride: (_cwd: string, fn: <T>() => T) => fn(),
+  pwd: () => mockCwd,
+  getCwd: () => mockCwd,
+}))
+// afterAll 还原真实 cwd 模块：'/Users/test/project' 假 cwd 不外溢给后加载
+// 的消费者（真实快照兜底导出面 + 还原，双保险）。
+afterAll(() => {
+  mock.module('src/utils/cwd.js', () => realCwdSnapshotGS)
+})
+
+// Defensive: agent.test.ts can corrupt Bun's src/* path alias at runtime.
+mock.module('src/utils/powershell/parser.js', () => ({
+  PS_TOKENIZER_DASH_CHARS: new Set(['-', '\u2013', '\u2014', '\u2015']),
+  COMMON_ALIASES: {},
+  commandHasArgAbbreviation: () => false,
+  deriveSecurityFlags: () => ({}),
+  getAllCommands: () => [],
+  getVariablesByScope: () => [],
+  hasCommandNamed: () => false,
+  parsePowerShellCommandCached: () => ({
+    valid: false,
+    errors: [],
+    statements: [],
+    variables: [],
+    hasStopParsing: false,
+    originalCommand: '',
+  }),
+}))
+
+const { isGitInternalPathPS, isDotGitPathPS } = await import('../gitSafety')
+
+describe('isGitInternalPathPS', () => {
+  test('detects .git/config', () => {
+    expect(isGitInternalPathPS('.git/config')).toBe(true)
+  })
+
+  test('detects .git/hooks/pre-commit', () => {
+    expect(isGitInternalPathPS('.git/hooks/pre-commit')).toBe(true)
+  })
+
+  test('detects HEAD', () => {
+    expect(isGitInternalPathPS('HEAD')).toBe(true)
+  })
+
+  test('detects refs/heads/main', () => {
+    expect(isGitInternalPathPS('refs/heads/main')).toBe(true)
+  })
+
+  test('detects objects/pack/abc.pack', () => {
+    expect(isGitInternalPathPS('objects/pack/abc.pack')).toBe(true)
+  })
+
+  test('detects hooks/pre-commit', () => {
+    expect(isGitInternalPathPS('hooks/pre-commit')).toBe(true)
+  })
+
+  test('detects .git', () => {
+    expect(isGitInternalPathPS('.git')).toBe(true)
+  })
+
+  test('detects .git/HEAD', () => {
+    expect(isGitInternalPathPS('.git/HEAD')).toBe(true)
+  })
+
+  test('normal file is not git-internal', () => {
+    expect(isGitInternalPathPS('src/main.ts')).toBe(false)
+  })
+
+  test('README.md is not git-internal', () => {
+    expect(isGitInternalPathPS('README.md')).toBe(false)
+  })
+
+  test('package.json is not git-internal', () => {
+    expect(isGitInternalPathPS('package.json')).toBe(false)
+  })
+
+  test('handles backslash paths (Windows)', () => {
+    expect(isGitInternalPathPS('.git\\config')).toBe(true)
+  })
+
+  test('handles .git with NTFS short name (git~1)', () => {
+    expect(isGitInternalPathPS('git~1/config')).toBe(true)
+  })
+
+  test('handles .git with NTFS short name variant (git~2)', () => {
+    expect(isGitInternalPathPS('git~2/HEAD')).toBe(true)
+  })
+
+  test('handles leading ./ prefix', () => {
+    expect(isGitInternalPathPS('./.git/config')).toBe(true)
+  })
+
+  test('handles quoted paths', () => {
+    expect(isGitInternalPathPS('".git/config"')).toBe(true)
+  })
+
+  test('handles backtick-escaped paths', () => {
+    expect(isGitInternalPathPS('`.gi`t/config')).toBe(true)
+  })
+})
+
+describe('isDotGitPathPS', () => {
+  test('detects .git/config', () => {
+    expect(isDotGitPathPS('.git/config')).toBe(true)
+  })
+
+  test('detects .git', () => {
+    expect(isDotGitPathPS('.git')).toBe(true)
+  })
+
+  test('detects .git/hooks/pre-commit', () => {
+    expect(isDotGitPathPS('.git/hooks/pre-commit')).toBe(true)
+  })
+
+  test('.gitignore is NOT a .git path', () => {
+    expect(isDotGitPathPS('.gitignore')).toBe(false)
+  })
+
+  test('.gitmodules is NOT a .git path', () => {
+    expect(isDotGitPathPS('.gitmodules')).toBe(false)
+  })
+
+  test('HEAD alone is NOT a .git path (could be non-git file)', () => {
+    expect(isDotGitPathPS('HEAD')).toBe(false)
+  })
+
+  test('refs/heads is NOT a .git path (bare-repo style)', () => {
+    expect(isDotGitPathPS('refs/heads/main')).toBe(false)
+  })
+
+  test('hooks/pre-commit is NOT a .git path (bare-repo style)', () => {
+    expect(isDotGitPathPS('hooks/pre-commit')).toBe(false)
+  })
+
+  test('handles NTFS short name git~1', () => {
+    expect(isDotGitPathPS('git~1/config')).toBe(true)
+  })
+
+  test('normal file is not .git path', () => {
+    expect(isDotGitPathPS('src/main.ts')).toBe(false)
+  })
+
+  test('handles backslash paths', () => {
+    expect(isDotGitPathPS('.git\\HEAD')).toBe(true)
+  })
+
+  test('handles quoted paths', () => {
+    expect(isDotGitPathPS('".git/HEAD"')).toBe(true)
+  })
+})

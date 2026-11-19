@@ -1,0 +1,420 @@
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from 'react'
+import AppContext from '../components/AppContext.js'
+import { ClockContext } from '../components/ClockContext.js'
+
+/**
+ * 官方 ink hooks 逆向还原（2.1.283 binary @152713000-152720000 区段提取，
+ * minified 反混淆）。
+ *
+ * 混淆名映射（提取区段实证）：
+ *   Pe=useContext  E=useRef  se=useCallback  X=useMemo  At=useSyncExternalStore
+ *   sn=useLayoutEffect  C=useEffect  RT=useReducer  G_=AppContext
+ *   sS=ClockContext  Uvn=ClockNowContext  tN=contains  Vg=行高常量
+ *
+ * 官方契约要点（与直觉不同的全部标注）：
+ *   useFocus()            —— 无参，返回 focusManager 操作集（非 {isFocused}）
+ *   useHasFocus(ref)      —— 参数是 ref，返回 activeElement contains(ref) 的布尔
+ *   useClock()            —— 返回 now() 函数（非数值）
+ *   useMeasured(getSnap)  —— 外部 store 模式（getSnapshot + layoutEffect 兜底）
+ *   usePaintedRows(en, r) —— 返回 [ref, rows, lastRows, contentRows] 四元组
+ *   useFinePointer(on)    —— 副作用 retain hook（无返回值）
+ *   rootOf(stdout)        —— 按 stdout 查已注册 root 实例（非树 parent 链）
+ *   topWithin(node, root) —— 两参：累加 computedTop 到 root（offset）
+ */
+
+type VoidFn = () => void
+const noop: VoidFn = () => {}
+/** subscribe 契约缺省兜底（VoidFn 返回形，避免与真实 subscribe 联合）。 */
+const noopSub: (cb: () => void) => VoidFn = () => noop
+
+// ── 焦点层（Pue / GV 原文）──
+
+export interface FocusManagerApi {
+  activeElement: unknown
+  focusNext: () => void
+  focusPrevious: () => void
+  focusDirection: (dir: string) => boolean
+  focus: (el: unknown) => void
+  blur: () => void
+  subscribe: (cb: () => void) => VoidFn
+}
+
+/** 官方 Pue：useFocus()——focusManager 操作集（activeElement 经 store 订阅）。 */
+export function useFocus(): FocusManagerApi {
+  const { focusManager, rootNode } = useContext(AppContext as never) as {
+    focusManager?: {
+      activeElement?: unknown
+      focusNext: (r: unknown) => void
+      focusPrevious: (r: unknown) => void
+      focusDirection: (d: string, r: unknown) => boolean
+      focus: (el: unknown) => void
+      blur: () => void
+      subscribe: (cb: () => void) => VoidFn
+    }
+    rootNode?: unknown
+  }
+  const activeElement = useCallback(
+    () => focusManager?.activeElement ?? null,
+    [focusManager],
+  )
+  const subscribe = focusManager?.subscribe ?? noopSub
+  const snap = useSyncExternalStoreShim(subscribe, activeElement)
+  return useMemo(
+    () => ({
+      activeElement: snap,
+      focusNext: () => {
+        if (focusManager && rootNode) focusManager.focusNext(rootNode)
+      },
+      focusPrevious: () => {
+        if (focusManager && rootNode) focusManager.focusPrevious(rootNode)
+      },
+      focusDirection: (dir: string) => {
+        if (focusManager && rootNode)
+          return focusManager.focusDirection(dir, rootNode)
+        return false
+      },
+      focus: (el: unknown) => focusManager?.focus(el),
+      blur: () => focusManager?.blur(),
+      subscribe,
+    }),
+    [snap, focusManager, rootNode],
+  )
+}
+
+/** 官方 GV：useHasFocus(ref)——activeElement 包含 ref.current（树 contains）。 */
+export function useHasFocus(ref: { current: unknown }): boolean {
+  const { focusManager } = useContext(AppContext as never) as {
+    focusManager?: {
+      activeElement?: unknown
+      subscribe: (cb: () => void) => VoidFn
+    }
+  }
+  const subscribe = focusManager?.subscribe ?? noopSub
+  const getSnapshot = useCallback(() => {
+    const el = ref.current
+    const active = focusManager?.activeElement
+    if (!el || !active) return false
+    return contains(active, el)
+  }, [ref, focusManager])
+  return useSyncExternalStoreShim(subscribe, getSnapshot, () => false)
+}
+
+/** core/focus 的 tN 等价：树 contains（parent 链上行）。 */
+function contains(ancestor: unknown, node: unknown): boolean {
+  let cur = node as { parentNode?: unknown } | null
+  while (cur) {
+    if (cur === ancestor) return true
+    cur = (cur as { parentNode?: unknown }).parentNode ?? null
+  }
+  return false
+}
+
+// ── 时钟层（na / jo / Iue 原文）──
+
+/** 官方 Yt：useClock()——ClockProvider 必需（错误契约：useClock must be
+ * used within a ClockProvider）；返回 now() 函数。 */
+export function useClock(): () => number {
+  const nowFn = useContext(ClockContext as never) as (() => number) | undefined
+  if (!nowFn) {
+    throw new Error('useClock must be used within a ClockProvider')
+  }
+  return nowFn
+}
+
+/** 官方 na：useInputClock()——取当前时钟值（缺省 Date.now）。 */
+export function useInputClock(): number {
+  const nowFn = useContext(ClockContext as never) as (() => number) | undefined
+  return (nowFn ?? Date.now)()
+}
+
+/** 官方 Iue：startClockInterval(store, fn, ms)——自排程循环（finally 重排）。 */
+export function startClockInterval(
+  store: { setTimeout: (fn: () => void, ms: number) => unknown },
+  fn: () => void,
+  ms: number,
+): VoidFn {
+  let stopped = false
+  let handle: unknown
+  const loop = (): void => {
+    if (stopped) return
+    try {
+      fn()
+    } finally {
+      if (!stopped) handle = store.setTimeout(loop, ms)
+    }
+  }
+  handle = store.setTimeout(loop, ms)
+  return () => {
+    stopped = true
+  }
+}
+
+// ── 测量层（od / Jo/Xi / Nvn 原文）──
+
+/** 官方 od：useMeasured(getSnapshot)——外部 store + layoutEffect 失同步兜底。 */
+export function useMeasured<T>(getSnapshot: () => T): T {
+  const { subscribeLayout } = useContext(AppContext as never) as {
+    subscribeLayout?: (cb: () => void) => VoidFn
+  }
+  const stored = useSyncExternalStoreShim(
+    subscribeLayout ?? noopSub,
+    getSnapshot,
+  )
+  const [, force] = useReducer((n: number) => n + 1, 0)
+  useEffect(() => {
+    if (!Object.is(getSnapshot(), stored)) force()
+  })
+  return stored
+}
+
+/** 官方 Jo/Xi：measureElement(node)——yoga 尺寸。 */
+export function measureElement(
+  node: {
+    yogaNode?: { getComputedWidth(): number; getComputedHeight(): number }
+  } | null,
+): { width: number; height: number } {
+  return {
+    width: node?.yogaNode?.getComputedWidth() ?? 0,
+    height: node?.yogaNode?.getComputedHeight() ?? 0,
+  }
+}
+
+/** 可视窗口片段（Ko/Qe 滚动裁剪等价）。 */
+export interface PaintedWindow {
+  first: number
+  last: number
+  of: number
+}
+
+/**
+ * 官方 Nvn：usePaintedRows(enabled, rows)——
+ * 返回 [ref, rows, lastRows, contentRows]；enabled 时订阅帧同步，
+ * rows 为可视窗口（滚动裁剪后），contentRows 为子节点总高。
+ */
+export function usePaintedRows(
+  enabled: boolean,
+  rows: PaintedWindow | number | undefined,
+): [
+  ref: { current: unknown },
+  rows: PaintedWindow | number | undefined,
+  lastRows: number | undefined,
+  contentRows: number | undefined,
+] {
+  const { subscribeFrames } = useContext(AppContext as never) as {
+    subscribeFrames?: (cb: () => void) => VoidFn
+  }
+  const ref = useRef<unknown>(null)
+  const stateRef = useRef<{
+    rows: PaintedWindow | number | undefined
+    lastRows: number | undefined
+    contentRows: number | undefined
+  }>({ rows, lastRows: undefined, contentRows: undefined })
+
+  const subscribe = useCallback(
+    (cb: () => void) =>
+      enabled && subscribeFrames ? subscribeFrames(cb) : noop,
+    [enabled, subscribeFrames],
+  )
+  const getSnapshot = useCallback(() => {
+    if (!enabled) return undefined
+    const el = ref.current as {
+      yogaNode?: { getComputedHeight(): number }
+      childNodes?: Array<{ yogaNode?: { getComputedHeight(): number } }>
+    } | null
+    const frameHeight = el?.yogaNode?.getComputedHeight()
+    const contentRows = el?.childNodes?.reduce(
+      (sum, k) => sum + (k.yogaNode?.getComputedHeight() ?? 0),
+      0,
+    )
+    const y = stateRef.current
+    const rowsChanged = contentRows === undefined || contentRows === y.rows
+    const contentChanged = frameHeight === undefined ? undefined : contentRows
+    if (!(rowsChanged && contentChanged === y.contentRows)) {
+      stateRef.current = {
+        rows: rowsChanged ? y.rows : contentRows,
+        lastRows: frameHeight ?? y.lastRows,
+        contentRows: contentChanged,
+      }
+    } else if (frameHeight !== undefined) {
+      y.lastRows = frameHeight
+    }
+    return stateRef.current
+  }, [enabled])
+
+  const snap = useSyncExternalStoreShim(subscribe, getSnapshot)
+  return [ref, snap?.rows, snap?.lastRows, snap?.contentRows]
+}
+
+// ── 终端能力（Dvn 原文）──
+
+/** 官方 Dvn：useFinePointer(enabled)——副作用 retain（无返回值）。 */
+export function useFinePointer(enabled: boolean): void {
+  const { retainFinePointer } = useContext(AppContext as never) as {
+    retainFinePointer?: () => VoidFn
+  }
+  useEffect(() => {
+    if (!enabled) return undefined
+    return retainFinePointer?.()
+  }, [enabled, retainFinePointer])
+}
+
+// ── 主题三层（语境还原：Provider 上下文折叠）──
+
+export interface ThemeOverride {
+  name: string
+  values: Record<string, string>
+}
+
+/**
+ * 官方主题层 Context 的完整字段契约（binary 字符串表实证）：
+ *   setThemeSetting / currentTheme / resolvedTheme / activeThemeOverrides /
+ *   activeCustomTheme / reloadCustomThemes / setPreviewOverrides /
+ *   watchSystemTheme / onThemeSave
+ */
+export interface ThemeContextContract {
+  /** 当前主题 id（'dark' | 'light' | 'auto' 等）。 */
+  themeSetting: string
+  /** 主题 id 写入。 */
+  setThemeSetting: (id: string) => void
+  /** 预览主题（设置面板实时预览）。 */
+  setPreviewTheme: (id: string) => void
+  /** 保存当前预览。 */
+  savePreview: () => void
+  /** 取消预览。 */
+  cancelPreview: () => void
+  /** 当前主题对象（id 或解析值）。 */
+  currentTheme: string
+  /** overrides 折叠后的最终值。 */
+  resolvedTheme: Record<string, string>
+  /** session 级覆盖层。 */
+  activeThemeOverrides: ThemeOverride[] | undefined
+  /** 用户自定义主题表（数组形态）。 */
+  customThemes: ThemeOverride[]
+  /** 激活的自定义主题。 */
+  activeCustomTheme: ThemeOverride | undefined
+  /** 重新加载自定义主题（async）。 */
+  reloadCustomThemes: () => Promise<void>
+  /** 预览覆盖（兼容别名）。 */
+  setPreviewOverrides: (o: ThemeOverride | null) => void
+}
+
+const ThemeOverridesContext = useMemoSafe<Partial<ThemeContextContract>>()
+
+export const ThemeOverridesProvider = ThemeOverridesContext.Provider
+
+/** 官方 useActiveThemeOverrides：session 级覆盖层。 */
+export function useActiveThemeOverrides(): ThemeOverride[] {
+  return useContext(ThemeOverridesContext)?.activeThemeOverrides ?? []
+}
+
+/** 官方 useCustomThemes：用户自定义主题表（数组契约 → name 键映射）。 */
+export function useCustomThemes(): Record<string, ThemeOverride> {
+  const themes = useContext(ThemeOverridesContext)?.customThemes
+  return themes ? Object.fromEntries(themes.map(t => [t.name, t])) : {}
+}
+
+/** 官方 fE：useResolvedTheme()——无参返回 resolvedTheme（fE 原文）。 */
+export function useResolvedTheme(): Record<string, string> {
+  return (
+    (useContext(ThemeOverridesContext) as Partial<ThemeContextContract>)
+      ?.resolvedTheme ?? {}
+  )
+}
+
+/** 官方 Zn：useTheme()——返回 [currentTheme, setThemeSetting]（Zn 原文：数组契约）。 */
+export function useTheme(): [string, (id: string) => void] {
+  const { currentTheme, setThemeSetting } = useContext(
+    ThemeOverridesContext,
+  ) as Partial<ThemeContextContract>
+  return [currentTheme ?? 'dark', setThemeSetting ?? noop]
+}
+
+/** 官方 toe：useThemeSetting()——返回当前 themeSetting id（toe 原文）。 */
+export function useThemeSetting(): string {
+  return (
+    (useContext(ThemeOverridesContext) as Partial<ThemeContextContract>)
+      ?.themeSetting ?? 'dark'
+  )
+}
+
+/** 官方 dqt：usePreviewTheme()——预览通道（setPreviewTheme 字段）。 */
+export function usePreviewTheme(): (id: string) => void {
+  return (
+    (useContext(ThemeOverridesContext) as Partial<ThemeContextContract>)
+      ?.setPreviewTheme ?? noop
+  )
+}
+
+// ── 树工具（Per / Wbe 原文）──
+
+/** 官方 Per：rootOf(stdout)——instances Map 查已注册 root（createRoot 注册）。 */
+export function rootOf(stdout: NodeJS.WriteStream = process.stdout): unknown {
+  const registry = require('../core/instances.js') as {
+    default: Map<NodeJS.WriteStream, unknown>
+  }
+  return registry.default.get(stdout)
+}
+
+/** 官方 Wbe：topWithin(node, root)——累加 computedTop 到 root（rootOff）。 */
+export function topWithin(
+  node: {
+    yogaNode?: { getComputedTop(): number }
+    parentNode?: unknown
+  } | null,
+  root: unknown,
+): number {
+  let offset = 0
+  let cur = node
+  while (cur !== undefined && cur !== null && cur !== root) {
+    offset += cur.yogaNode?.getComputedTop() ?? 0
+    cur = (cur as { parentNode?: unknown }).parentNode as typeof cur
+  }
+  return cur === root ? offset : -1
+}
+
+// ── useSyncExternalStore 兼容 shim（react 版本差异隔离）──
+
+function useSyncExternalStoreShim<T>(
+  subscribe: (cb: () => void) => VoidFn,
+  getSnapshot: () => T,
+  getServerSnapshot?: () => T,
+): T {
+  const React = require('react') as {
+    useSyncExternalStore?: (
+      s: (cb: () => void) => VoidFn,
+      g: () => T,
+      gs?: () => T,
+    ) => T
+  }
+  if (React.useSyncExternalStore) {
+    return React.useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+  }
+  const [_, force] = useReducer((n: number) => n + 1, 0)
+  useEffect(() => subscribe(force), [subscribe])
+  return getSnapshot()
+}
+
+// ── 屏幕阅读器（官方导出面；env 惯例标记）──
+
+/** 官方 useIsScreenReaderEnabled：STDIN 屏幕阅读器标记。 */
+export function useIsScreenReaderEnabled(): boolean {
+  const [enabled] = useState(
+    () => process.env['CLAUDE_CODE_SCREEN_READER'] === '1',
+  )
+  return enabled
+}
+
+function useMemoSafe<T>(): React.Context<T | undefined> {
+  const react = require('react') as {
+    createContext: <U>(defaultValue: U) => React.Context<U>
+  }
+  return react.createContext<T | undefined>(undefined)
+}

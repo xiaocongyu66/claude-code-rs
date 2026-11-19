@@ -1,0 +1,309 @@
+import { promises as fsp } from 'fs'
+import { getSdkAgentProgressSummariesEnabled } from 'src/bootstrap/state.js'
+import { getSystemPrompt } from 'src/constants/prompts.js'
+import { isCoordinatorMode } from 'src/coordinator/coordinatorMode.js'
+import type { CanUseToolFn } from 'src/hooks/useCanUseTool.js'
+import type { ToolUseContext } from 'src/Tool.js'
+import { registerAsyncAgent } from 'src/tasks/LocalAgentTask/LocalAgentTask.js'
+import { assembleToolPool } from 'src/tools.js'
+import { filterParentToolsForFork } from 'src/utils/agentToolFilter.js'
+import { asAgentId } from 'src/types/ids.js'
+import { runWithAgentContext } from 'src/utils/agentContext.js'
+import { runWithCwdOverride } from 'src/utils/cwd.js'
+import { logForDebugging } from 'src/utils/debug.js'
+import {
+  createUserMessage,
+  filterOrphanedThinkingOnlyMessages,
+  filterUnresolvedToolUses,
+  filterWhitespaceOnlyAssistantMessages,
+} from 'src/utils/messages.js'
+import { getAgentModel } from 'src/utils/model/agent.js'
+import { getQuerySourceForAgent } from 'src/utils/promptCategory.js'
+import {
+  getAgentTranscript,
+  readAgentMetadata,
+} from 'src/utils/sessionStorage.js'
+import { buildEffectiveSystemPrompt } from 'src/utils/systemPrompt.js'
+import type { SystemPrompt } from 'src/utils/systemPromptType.js'
+import {
+  deliverOnResume,
+  recordTaskHandle,
+} from 'src/services/taskRegistry/taskRegistry.js'
+import { getTaskOutputPath } from 'src/utils/task/diskOutput.js'
+import { getParentSessionId } from 'src/utils/teammate.js'
+import { reconstructForSubagentResume } from 'src/utils/toolResultStorage.js'
+import { runAsyncAgentLifecycle } from './agentToolUtils.js'
+import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js'
+import { FORK_AGENT, isForkSubagentEnabled } from './forkSubagent.js'
+import type { AgentDefinition } from './loadAgentsDir.js'
+import { isBuiltInAgent } from './loadAgentsDir.js'
+import { runAgent } from './runAgent.js'
+import { publishUserResumeNotice } from './userResumeNotice.js'
+
+export type ResumeAgentResult = {
+  agentId: string
+  description: string
+  outputFile: string
+}
+
+export async function resumeAgentBackground({
+  agentId,
+  prompt,
+  toolUseContext,
+  canUseTool,
+  invokingRequestId,
+}: {
+  agentId: string
+  prompt: string
+  toolUseContext: ToolUseContext
+  canUseTool: CanUseToolFn
+  invokingRequestId?: string
+}): Promise<ResumeAgentResult> {
+  const startTime = Date.now()
+  const appState = toolUseContext.getAppState()
+  // In-process teammates get a no-op setAppState; setAppStateForTasks
+  // reaches the root store so task registration/progress/kill stay visible.
+  const rootSetAppState =
+    toolUseContext.setAppStateForTasks ?? toolUseContext.setAppState
+  const permissionMode = appState.toolPermissionContext.mode
+
+  const [transcript, meta] = await Promise.all([
+    getAgentTranscript(asAgentId(agentId)),
+    readAgentMetadata(asAgentId(agentId)),
+  ])
+  if (!transcript) {
+    throw new Error(`No transcript found for agent ID: ${agentId}`)
+  }
+  const resumedMessages = filterWhitespaceOnlyAssistantMessages(
+    filterOrphanedThinkingOnlyMessages(
+      filterUnresolvedToolUses(transcript.messages),
+    ),
+  )
+  const resumedReplacementState = reconstructForSubagentResume(
+    toolUseContext.contentReplacementState,
+    resumedMessages,
+    transcript.contentReplacements,
+  )
+  // Best-effort: if the original worktree was removed externally, fall back
+  // to parent cwd rather than crashing on chdir later.
+  const resumedWorktreePath = meta?.worktreePath
+    ? await fsp.stat(meta.worktreePath).then(
+        s => (s.isDirectory() ? meta.worktreePath : undefined),
+        () => {
+          logForDebugging(
+            `Resumed worktree ${meta.worktreePath} no longer exists; falling back to parent cwd`,
+          )
+          return undefined
+        },
+      )
+    : undefined
+  if (resumedWorktreePath) {
+    // Bump mtime so stale-worktree cleanup doesn't delete a just-resumed worktree (#22355)
+    const now = new Date()
+    await fsp.utimes(resumedWorktreePath, now, now)
+  }
+
+  // Skip filterDeniedAgents re-gating — original spawn already passed permission checks
+  let selectedAgent: AgentDefinition
+  let isResumedFork = false
+  if (meta?.agentType === FORK_AGENT.agentType) {
+    selectedAgent = FORK_AGENT
+    isResumedFork = true
+  } else if (meta?.agentType) {
+    const found = toolUseContext.options.agentDefinitions.activeAgents.find(
+      a => a.agentType === meta.agentType,
+    )
+    selectedAgent = found ?? GENERAL_PURPOSE_AGENT
+  } else {
+    selectedAgent = GENERAL_PURPOSE_AGENT
+  }
+
+  const uiDescription = meta?.description ?? '(resumed)'
+
+  let forkParentSystemPrompt: SystemPrompt | undefined
+  if (isResumedFork) {
+    if (toolUseContext.renderedSystemPrompt) {
+      forkParentSystemPrompt = toolUseContext.renderedSystemPrompt
+    } else {
+      const mainThreadAgentDefinition = appState.agent
+        ? appState.agentDefinitions.activeAgents.find(
+            a => a.agentType === appState.agent,
+          )
+        : undefined
+      const additionalWorkingDirectories = Array.from(
+        appState.toolPermissionContext.additionalWorkingDirectories.keys(),
+      )
+      const defaultSystemPrompt = await getSystemPrompt(
+        toolUseContext.options.tools,
+        toolUseContext.options.mainLoopModel,
+        additionalWorkingDirectories,
+        toolUseContext.options.mcpClients,
+      )
+      forkParentSystemPrompt = buildEffectiveSystemPrompt({
+        mainThreadAgentDefinition,
+        toolUseContext,
+        customSystemPrompt: toolUseContext.options.customSystemPrompt,
+        defaultSystemPrompt,
+        appendSystemPrompt: toolUseContext.options.appendSystemPrompt,
+      })
+    }
+    if (!forkParentSystemPrompt) {
+      throw new Error(
+        'Cannot resume fork agent: unable to reconstruct parent system prompt',
+      )
+    }
+  }
+
+  // Resolve model for analytics metadata (runAgent resolves its own internally)
+  const resolvedAgentModel = getAgentModel(
+    selectedAgent.model,
+    toolUseContext.options.mainLoopModel,
+    undefined,
+    permissionMode,
+  )
+
+  const workerPermissionContext = {
+    ...appState.toolPermissionContext,
+    mode: selectedAgent.permissionMode ?? 'acceptEdits',
+  }
+  const workerTools = isResumedFork
+    ? filterParentToolsForFork(toolUseContext.options.tools)
+    : assembleToolPool(workerPermissionContext, appState.mcp.tools)
+
+  const runAgentParams: Parameters<typeof runAgent>[0] = {
+    agentDefinition: selectedAgent,
+    promptMessages: [
+      ...resumedMessages,
+      createUserMessage({ content: prompt }),
+    ],
+    toolUseContext,
+    canUseTool,
+    isAsync: true,
+    querySource: getQuerySourceForAgent(
+      selectedAgent.agentType,
+      isBuiltInAgent(selectedAgent),
+    ),
+    model: undefined,
+    // Fork resume: pass parent's system prompt (cache-identical prefix).
+    // Non-fork: undefined → runAgent recomputes under wrapWithCwd so
+    // getCwd() sees resumedWorktreePath.
+    override: isResumedFork
+      ? { systemPrompt: forkParentSystemPrompt }
+      : undefined,
+    availableTools: workerTools,
+    // Transcript already contains the parent context slice from the
+    // original fork. Re-supplying it would cause duplicate tool_use IDs.
+    forkContextMessages: undefined,
+    ...(isResumedFork && { useExactTools: true }),
+    // Re-persist so metadata survives runAgent's writeAgentMetadata overwrite
+    worktreePath: resumedWorktreePath,
+    description: meta?.description,
+    contentReplacementState: resumedReplacementState,
+  }
+
+  // Skip name-registry write — original entry persists from the initial spawn
+  const agentBackgroundTask = registerAsyncAgent({
+    agentId,
+    description: uiDescription,
+    prompt,
+    selectedAgent,
+    setAppState: rootSetAppState,
+    toolUseId: toolUseContext.toolUseId,
+  })
+
+  // CCH #52/#46 复活面 → 中央句柄表重开。Q2 收敛（官方 $M :8428 原文只
+  // 清停车位、不动 status）：unpark 现为纯 $M 静默清停；把已冻结终态句柄
+  // 重开为 running 走显式 reopenRunning 接线路（registerAsyncAgent 的
+  // running 写在已冻结句柄上会被终态冻结吞掉，复活路必须显式重开）。
+  //
+  // CCH 审查修复（官方 $M 咽喉单点补投还原）：显式 resume 即官方 :8428
+  // `$M(e,n,…)` 的 CCH 对应咽喉 —— 重开前对句柄表内 !notified 的终态句柄
+  // 单点补投一次尸讯（读 description/outputFile 组正文，等价官方 $ot 的
+  // `Background agent "<desc>" was stopped by user` 信封），随后不再回放。
+  // 无目录扫描、无全局补投、无跨会话广播（进程死亡 = 表清空）。
+  const corpse = deliverOnResume(agentId)
+  if (corpse) {
+    const { enqueuePendingNotification } = await import(
+      'src/utils/messageQueueManager.js'
+    )
+    enqueuePendingNotification({
+      value:
+        `<system-reminder>Background agent "${corpse.description}" (${corpse.id}) was stopped by user — its result was never delivered.` +
+        `${corpse.outputFile ? ` Partial output: ${corpse.outputFile}.` : ''} It is being resumed now.</system-reminder>`,
+      mode: 'task-notification',
+      priority: 'next',
+    })
+  }
+  recordTaskHandle({
+    id: agentId,
+    type: 'local_agent',
+    status: 'running',
+    description: uiDescription,
+    outputFile: getTaskOutputPath(agentId),
+    reopenRunning: true,
+  })
+
+  const metadata = {
+    prompt,
+    resolvedAgentModel,
+    isBuiltInAgent: isBuiltInAgent(selectedAgent),
+    startTime,
+    agentType: selectedAgent.agentType,
+    isAsync: true,
+  }
+
+  const asyncAgentContext = {
+    agentId,
+    parentSessionId: getParentSessionId(),
+    agentType: 'subagent' as const,
+    subagentName: selectedAgent.agentType,
+    isBuiltIn: isBuiltInAgent(selectedAgent),
+    invokingRequestId,
+    invocationKind: 'resume' as const,
+    invocationEmitted: false,
+  }
+
+  const wrapWithCwd = <T>(fn: () => T): T =>
+    resumedWorktreePath ? runWithCwdOverride(resumedWorktreePath, fn) : fn()
+
+  void runWithAgentContext(asyncAgentContext, () =>
+    wrapWithCwd(() =>
+      runAsyncAgentLifecycle({
+        taskId: agentBackgroundTask.agentId,
+        abortController: agentBackgroundTask.abortController!,
+        makeStream: onCacheSafeParams =>
+          runAgent({
+            ...runAgentParams,
+            override: {
+              ...runAgentParams.override,
+              agentId: asAgentId(agentBackgroundTask.agentId),
+              abortController: agentBackgroundTask.abortController!,
+            },
+            onCacheSafeParams,
+          }),
+        metadata,
+        description: uiDescription,
+        toolUseContext,
+        rootSetAppState,
+        agentIdForCleanup: agentId,
+        enableSummarization:
+          isCoordinatorMode() ||
+          isForkSubagentEnabled() ||
+          getSdkAgentProgressSummariesEnabled(),
+        getWorktreeResult: async () =>
+          resumedWorktreePath ? { worktreePath: resumedWorktreePath } : {},
+      }),
+    ),
+  )
+
+  // CCH #52/#46: 复活成功 → 父会话队列一条官方制式复活通知（userResumeNotice，
+  // 见 ./userResumeNotice.js —— 模型不得把复活当作已取消而重启；结果经后续
+  // task-notification 到达）。
+  void publishUserResumeNotice(agentId, uiDescription)
+
+  return {
+    agentId,
+    description: uiDescription,
+    outputFile: getTaskOutputPath(agentId),
+  }
+}

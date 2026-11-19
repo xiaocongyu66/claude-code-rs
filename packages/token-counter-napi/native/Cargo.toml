@@ -1,0 +1,23 @@
+[package]
+name = "token-counter-napi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+# 与 vendor_tiktoken.rs 上游（tiktoken-rs 0.6.0）一致
+base64 = "0.21"
+fancy-regex = "0.13"
+rustc-hash = "1.1"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

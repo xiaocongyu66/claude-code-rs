@@ -1,0 +1,629 @@
+import { randomUUID } from 'crypto'
+import OpenAI from 'openai'
+import type { BetaRawMessageStreamEvent } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+import { normalizeOpenAIUsage, type AnthropicUsage } from '@ant/model-provider'
+import { getProxyFetchOptions } from '../../../utils/proxy.js'
+import {
+  getValidChatGPTAuth,
+  invalidateChatGPTTokenCache,
+} from './chatgptAuth.js'
+import { createStreamWatchdog } from './streamWatchdog.js'
+
+type ResponsesInputItem = Record<string, unknown>
+type ResponsesTool = Record<string, unknown>
+export type ResponsesReasoningEffort =
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+
+type ResponsesRequest = {
+  model: string
+  stream: true
+  store: false
+  input: ResponsesInputItem[]
+  instructions?: string
+  tools?: ResponsesTool[]
+  tool_choice?: unknown
+  reasoning?: { effort: ResponsesReasoningEffort }
+  parallel_tool_calls?: boolean
+  /** Sticky cache routing key — stable for the CCB session. */
+  prompt_cache_key: string
+}
+
+function textFromContent(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(part => {
+      if (!part || typeof part !== 'object') return ''
+      const record = part as Record<string, unknown>
+      if (typeof record.text === 'string') return record.text
+      return ''
+    })
+    .filter(Boolean)
+    .join('\n')
+}
+
+function convertUserContent(content: unknown): unknown {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return textFromContent(content)
+  const result: Array<Record<string, unknown>> = []
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue
+    const record = part as Record<string, unknown>
+    if (record.type === 'text' && typeof record.text === 'string') {
+      result.push({ type: 'input_text', text: record.text })
+    } else if (record.type === 'image_url') {
+      const imageUrl = record.image_url as Record<string, unknown> | undefined
+      if (typeof imageUrl?.url === 'string') {
+        result.push({ type: 'input_image', image_url: imageUrl.url })
+      }
+    }
+  }
+  return result.length > 0 ? result : textFromContent(content)
+}
+
+function convertMessagesToResponsesInput(messages: unknown[]): {
+  input: ResponsesInputItem[]
+  instructions?: string
+} {
+  const input: ResponsesInputItem[] = []
+  const instructions: string[] = []
+
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue
+    const record = message as Record<string, unknown>
+    const role = record.role
+
+    if (role === 'system' || role === 'developer') {
+      const text = textFromContent(record.content)
+      if (text) instructions.push(text)
+      continue
+    }
+
+    if (role === 'tool') {
+      const callId = record.tool_call_id
+      if (typeof callId === 'string') {
+        input.push({
+          type: 'function_call_output',
+          call_id: callId,
+          output: textFromContent(record.content),
+        })
+      }
+      continue
+    }
+
+    if (role === 'assistant') {
+      const text = textFromContent(record.content)
+      if (text) {
+        input.push({ role: 'assistant', content: text })
+      }
+      const toolCalls = record.tool_calls
+      if (Array.isArray(toolCalls)) {
+        for (const toolCall of toolCalls) {
+          if (!toolCall || typeof toolCall !== 'object') continue
+          const tc = toolCall as Record<string, unknown>
+          const fn = tc.function as Record<string, unknown> | undefined
+          const id = typeof tc.id === 'string' ? tc.id : undefined
+          const name = typeof fn?.name === 'string' ? fn.name : undefined
+          if (!id || !name) continue
+          input.push({
+            type: 'function_call',
+            call_id: id,
+            name,
+            arguments: typeof fn?.arguments === 'string' ? fn.arguments : '{}',
+          })
+        }
+      }
+      continue
+    }
+
+    if (role === 'user') {
+      input.push({
+        role: 'user',
+        content: convertUserContent(record.content),
+      })
+    }
+  }
+
+  return {
+    input,
+    instructions:
+      instructions.length > 0 ? instructions.join('\n\n') : undefined,
+  }
+}
+
+function convertToolsToResponses(tools: unknown[]): ResponsesTool[] {
+  const result: ResponsesTool[] = []
+  for (const tool of tools) {
+    if (!tool || typeof tool !== 'object') continue
+    const record = tool as Record<string, unknown>
+    const fn = record.function as Record<string, unknown> | undefined
+    const name = typeof fn?.name === 'string' ? fn.name : undefined
+    if (!name) continue
+    result.push({
+      type: 'function',
+      name,
+      description: typeof fn?.description === 'string' ? fn.description : '',
+      parameters:
+        fn?.parameters && typeof fn.parameters === 'object'
+          ? fn.parameters
+          : { type: 'object', properties: {} },
+      strict: false,
+    })
+  }
+  return result
+}
+
+function convertToolChoiceToResponses(toolChoice: unknown): unknown {
+  if (toolChoice === 'required') return 'required'
+  if (toolChoice === 'auto') return 'auto'
+  if (!toolChoice || typeof toolChoice !== 'object') return toolChoice
+  const record = toolChoice as Record<string, unknown>
+  const fn = record.function as Record<string, unknown> | undefined
+  if (record.type === 'function' && typeof fn?.name === 'string') {
+    return { type: 'function', name: fn.name }
+  }
+  return toolChoice
+}
+
+export function buildResponsesRequest(params: {
+  model: string
+  messages: unknown[]
+  tools: unknown[]
+  toolChoice: unknown
+  reasoningEffort?: ResponsesReasoningEffort
+  /** Session-scoped key supplied only by the ChatGPT OAuth route. */
+  promptCacheKey: string
+}): ResponsesRequest {
+  const { input, instructions } = convertMessagesToResponsesInput(
+    params.messages,
+  )
+  const tools = convertToolsToResponses(params.tools)
+  return {
+    model: params.model,
+    stream: true,
+    store: false,
+    input,
+    ...(instructions ? { instructions } : {}),
+    ...(tools.length > 0 ? { tools } : {}),
+    ...(params.toolChoice
+      ? { tool_choice: convertToolChoiceToResponses(params.toolChoice) }
+      : {}),
+    ...(params.reasoningEffort
+      ? { reasoning: { effort: params.reasoningEffort } }
+      : {}),
+    parallel_tool_calls: true,
+    // Same OAuth session → same key so OpenAI can sticky-route to a cache node.
+    // Must not hash the full message list (would change every turn).
+    prompt_cache_key: params.promptCacheKey,
+  }
+}
+
+/**
+ * Map OpenAI Responses usage → Anthropic-style mutually exclusive fields.
+ *
+ * OpenAI:  input_tokens is TOTAL input; cached_tokens ⊆ input_tokens;
+ *          cache_write_tokens (GPT-5.6+) reports tokens written this turn.
+ * Anthropic: input + cache_creation + cache_read are disjoint and sum to total.
+ *
+ * Without subtracting cached from input, cacheWarning hit-rate becomes
+ * cached/(total+cached) with a hard ceiling of 50%.
+ */
+export function extractUsage(
+  response: Record<string, unknown> | undefined,
+): AnthropicUsage {
+  const usage = response?.usage as Record<string, unknown> | undefined
+  const inputDetails = usage?.input_tokens_details as
+    | Record<string, unknown>
+    | undefined
+
+  const totalInput =
+    typeof usage?.input_tokens === 'number' ? usage.input_tokens : 0
+  const outputTokens =
+    typeof usage?.output_tokens === 'number' ? usage.output_tokens : 0
+
+  const cachedRaw =
+    typeof inputDetails?.cached_tokens === 'number'
+      ? inputDetails.cached_tokens
+      : 0
+  const writeRaw =
+    typeof inputDetails?.cache_write_tokens === 'number'
+      ? inputDetails.cache_write_tokens
+      : 0
+
+  return normalizeOpenAIUsage({
+    totalInputTokens: totalInput,
+    outputTokens,
+    cacheReadTokens: cachedRaw,
+    cacheWriteTokens: writeRaw,
+  })
+}
+
+function mapStopReason(response: Record<string, unknown> | undefined): string {
+  if (response?.status === 'incomplete') return 'max_tokens'
+  return 'end_turn'
+}
+
+export async function* adaptResponsesStreamToAnthropic(
+  stream: AsyncIterable<Record<string, unknown>>,
+  model: string,
+): AsyncGenerator<BetaRawMessageStreamEvent, void> {
+  const messageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+  const toolBlocks = new Map<
+    number,
+    { contentIndex: number; open: boolean; name: string; id: string }
+  >()
+  let started = false
+  let currentContentIndex = -1
+  let textBlockOpen = false
+  let thinkingBlockOpen = false
+
+  const ensureStarted = async function* () {
+    if (started) return
+    started = true
+    yield {
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      },
+    } as unknown as BetaRawMessageStreamEvent
+  }
+
+  for await (const event of stream) {
+    for await (const startedEvent of ensureStarted()) yield startedEvent
+    const type = event.type
+
+    if (type === 'response.output_text.delta') {
+      if (!textBlockOpen) {
+        if (thinkingBlockOpen) {
+          yield {
+            type: 'content_block_stop',
+            index: currentContentIndex,
+          } as BetaRawMessageStreamEvent
+          thinkingBlockOpen = false
+        }
+        currentContentIndex++
+        textBlockOpen = true
+        yield {
+          type: 'content_block_start',
+          index: currentContentIndex,
+          content_block: { type: 'text', text: '' },
+        } as BetaRawMessageStreamEvent
+      }
+      yield {
+        type: 'content_block_delta',
+        index: currentContentIndex,
+        delta: { type: 'text_delta', text: String(event.delta ?? '') },
+      } as BetaRawMessageStreamEvent
+      continue
+    }
+
+    if (type === 'response.reasoning_text.delta') {
+      if (!thinkingBlockOpen) {
+        if (textBlockOpen) {
+          yield {
+            type: 'content_block_stop',
+            index: currentContentIndex,
+          } as BetaRawMessageStreamEvent
+          textBlockOpen = false
+        }
+        currentContentIndex++
+        thinkingBlockOpen = true
+        yield {
+          type: 'content_block_start',
+          index: currentContentIndex,
+          content_block: { type: 'thinking', thinking: '', signature: '' },
+        } as BetaRawMessageStreamEvent
+      }
+      yield {
+        type: 'content_block_delta',
+        index: currentContentIndex,
+        delta: { type: 'thinking_delta', thinking: String(event.delta ?? '') },
+      } as BetaRawMessageStreamEvent
+      continue
+    }
+
+    if (type === 'response.output_item.added') {
+      const item = event.item as Record<string, unknown> | undefined
+      const outputIndex =
+        typeof event.output_index === 'number' ? event.output_index : -1
+      if (item?.type === 'function_call' && outputIndex >= 0) {
+        if (textBlockOpen) {
+          yield {
+            type: 'content_block_stop',
+            index: currentContentIndex,
+          } as BetaRawMessageStreamEvent
+          textBlockOpen = false
+        }
+        if (thinkingBlockOpen) {
+          yield {
+            type: 'content_block_stop',
+            index: currentContentIndex,
+          } as BetaRawMessageStreamEvent
+          thinkingBlockOpen = false
+        }
+        currentContentIndex++
+        const id = String(item.call_id ?? item.id ?? `call_${outputIndex}`)
+        const name = String(item.name ?? '')
+        toolBlocks.set(outputIndex, {
+          contentIndex: currentContentIndex,
+          open: true,
+          name,
+          id,
+        })
+        yield {
+          type: 'content_block_start',
+          index: currentContentIndex,
+          content_block: { type: 'tool_use', id, name, input: {} },
+        } as BetaRawMessageStreamEvent
+      }
+      continue
+    }
+
+    if (type === 'response.function_call_arguments.delta') {
+      const outputIndex =
+        typeof event.output_index === 'number' ? event.output_index : -1
+      const block = toolBlocks.get(outputIndex)
+      if (block) {
+        yield {
+          type: 'content_block_delta',
+          index: block.contentIndex,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: String(event.delta ?? ''),
+          },
+        } as BetaRawMessageStreamEvent
+      }
+      continue
+    }
+
+    if (type === 'response.output_item.done') {
+      const outputIndex =
+        typeof event.output_index === 'number' ? event.output_index : -1
+      const block = toolBlocks.get(outputIndex)
+      if (block?.open) {
+        yield {
+          type: 'content_block_stop',
+          index: block.contentIndex,
+        } as BetaRawMessageStreamEvent
+        block.open = false
+      }
+      continue
+    }
+
+    if (type === 'response.error') {
+      const error = event.error as Record<string, unknown> | undefined
+      throw new Error(String(error?.message ?? 'ChatGPT Responses API error'))
+    }
+
+    if (type === 'response.failed') {
+      const response = event.response as Record<string, unknown> | undefined
+      const error = response?.error as Record<string, unknown> | undefined
+      throw new Error(String(error?.message ?? 'ChatGPT Responses API failed'))
+    }
+
+    if (type === 'response.completed' || type === 'response.incomplete') {
+      if (textBlockOpen) {
+        yield {
+          type: 'content_block_stop',
+          index: currentContentIndex,
+        } as BetaRawMessageStreamEvent
+        textBlockOpen = false
+      }
+      if (thinkingBlockOpen) {
+        yield {
+          type: 'content_block_stop',
+          index: currentContentIndex,
+        } as BetaRawMessageStreamEvent
+        thinkingBlockOpen = false
+      }
+      const response = event.response as Record<string, unknown> | undefined
+      yield {
+        type: 'message_delta',
+        delta: { stop_reason: mapStopReason(response), stop_sequence: null },
+        usage: extractUsage(response),
+      } as unknown as BetaRawMessageStreamEvent
+      yield { type: 'message_stop' } as BetaRawMessageStreamEvent
+    }
+  }
+}
+
+const CHATGPT_RESPONSES_URL = 'https://chatgpt.com/backend-api/codex/responses'
+
+/**
+ * Stream the ChatGPT Codex Responses API through the official OpenAI SDK.
+ *
+ * The SDK client is built per request: the ChatGPT access token rotates and
+ * the backend lives under a non-OpenAI base URL that cannot be shared with
+ * the Chat Completions client. The SDK carries transport concerns (auth
+ * header, abort, proxy fetch options); response frames are still raw
+ * Responses events consumed by adaptResponsesStreamToAnthropic — chunk shape
+ * is identical to what the retired hand-rolled SSE frame parser produced.
+ *
+ * The idle watchdog wraps the returned stream: silence beyond
+ * CLAUDE_CODE_STREAM_IDLE_TIMEOUT_MS aborts the request through the watchdog
+ * signal (passed to the SDK create() call) and lands the same structured
+ * error as the Chat Completions path. The upstream abort signal stays linked
+ * through the watchdog.
+ */
+type CodexAuth = Awaited<ReturnType<typeof getValidChatGPTAuth>>
+
+/**
+ * Codex client LRU cache — W6.3：单槽改 LRU(2)。官方 0003-chunk-zrkp23rq/
+ * module-005-uncategorized.js:1291（assumed-role session cache 原文）：
+ *   let R=new Map;
+ *   function D(U){let B=h(U),G={client:e.buildClient(B),credentials:B,
+ *     createdAt:Date.now()};if(R.size>=r)R.delete(R.keys().next().value);
+ *     return R.set(U,G),G}
+ * —— 封顶 Map、超限驱逐最旧键（插入序）；命中条件失效：
+ *   `invalidate:()=>Date.now()-B.createdAt>=Pj&&j(B,G)` + `j(U,B){...
+ *   return R.get(B)===U&&R.delete(B)}`（条件不满足才删）。
+ * CCH 对应：key=token|accountId（键变即条件失效重建，官方 sharedClient 面
+ * `g=h?h.sharedClient:buildClient(...)`，0003 model-provider/anthropic.js:41），
+ * fetch 身份纳入失效判定（globalThis.fetch 是进程级可替换面——测试注入/
+ * 代理链路切换，捕获引用不一致即重建，否则旧 fetch 的行为泄漏给新调用方）。
+ * 容量取 2：token 轮换瞬间（旧/新键交替）保留一份旧池，避免每次刷新都
+ * 丢弃 keep-alive 连接池（chatgpt.com 对并发握手限流，见下 sharedClient 注）。
+ * 429 pCo（anthropic-ratelimit-unified-reset）在 codex 层未消费：chatgpt.com
+ * backend 不发该头，恒走 `un=zo??…` 的 XD 回落侧——取舍声明同
+ * connectionRetry.ts gateDelayMs。
+ */
+const CODEX_CLIENT_CACHE_LIMIT = 2
+let cachedCodexClients: Map<
+  string,
+  { client: OpenAI; fetchRef: typeof fetch }
+> = new Map()
+
+function getCachedCodexClient(
+  cacheKey: string,
+  currentFetch: typeof fetch,
+): OpenAI | null {
+  const hit = cachedCodexClients.get(cacheKey)
+  if (!hit) return null
+  // 条件失效（官方 j(U,B) 面）：fetch 身份漂移的条目按失效删除。
+  if (hit.fetchRef !== currentFetch) {
+    cachedCodexClients.delete(cacheKey)
+    return null
+  }
+  // LRU 触碰：重插到 Map 尾部（插入序 = 最近使用序）。
+  cachedCodexClients.delete(cacheKey)
+  cachedCodexClients.set(cacheKey, hit)
+  return hit.client
+}
+
+function storeCodexClient(
+  cacheKey: string,
+  client: OpenAI,
+  fetchRef: typeof fetch,
+): void {
+  cachedCodexClients.delete(cacheKey)
+  // 官方 D(U) 面驱逐：超限先删最旧键（Map 插入序头元素）再插入。
+  while (cachedCodexClients.size >= CODEX_CLIENT_CACHE_LIMIT) {
+    const oldest = cachedCodexClients.keys().next().value
+    if (oldest === undefined) break
+    cachedCodexClients.delete(oldest)
+  }
+  cachedCodexClients.set(cacheKey, { client, fetchRef })
+}
+
+/**
+ * W2.11 invalidate 面（官方 `_authState.tokenCache.invalidate()` 的 CCH
+ * 对应，0032-chunk-dyqmyxqn/module-002-class-hierarchy.js:7 Egt 原文
+ * `invalidate(){this.cached=null,this.nextForce=!0}`）：401 刷新重试前——
+ * 1) 丢缓存 codex client（token 键重读重建，keep-alive 池随之换新）；
+ * 2) `nextForce=!0`：强制下一次 getValidChatGPTAuth() 经 refreshTokens
+ *    换新凭据——旧实现在这一步只丢 client 缓存，被吊销但未过期的 token
+ *    原样重发（W2.4），刷新后的 refreshToken 才能让服务端签发新 AT。
+ */
+export function invalidateCachedCodexClient(): void {
+  cachedCodexClients.clear()
+  invalidateChatGPTTokenCache()
+}
+
+function buildCodexClient(
+  auth: CodexAuth,
+  fetchOverride?: typeof fetch,
+): OpenAI {
+  return new OpenAI({
+    apiKey: auth.accessToken,
+    baseURL: 'https://chatgpt.com/backend-api/codex',
+    // Large finite timeout (0 would arm a 0ms abort in the SDK's
+    // fetchWithTimeout); it covers headers only and never caps a streaming
+    // body — stalls are guarded by the idle watchdog. Retries belong to
+    // QueryEngine.
+    timeout: 600_000,
+    maxRetries: 0,
+    dangerouslyAllowBrowser: true,
+    defaultHeaders: {
+      'OpenAI-Beta': 'responses=experimental',
+      Origin: 'https://chatgpt.com',
+      Referer: 'https://chatgpt.com/',
+      originator: 'claude-code-hardened',
+      ...(auth.accountId ? { 'ChatGPT-Account-Id': auth.accountId } : {}),
+    },
+    fetchOptions: getProxyFetchOptions({ forAnthropicAPI: false }),
+    ...(fetchOverride ? { fetch: fetchOverride } : {}),
+  })
+}
+
+export async function createChatGPTResponsesStream(params: {
+  request: ResponsesRequest
+  signal: AbortSignal
+  fetchOverride?: typeof fetch
+}): Promise<AsyncIterable<Record<string, unknown>> & { dispose(): void }> {
+  const auth = await getValidChatGPTAuth()
+  const watchdog = createStreamWatchdog({
+    url: CHATGPT_RESPONSES_URL,
+    model: params.request.model,
+    externalSignal: params.signal,
+  })
+  try {
+    // Official sharedClient semantics (reverse-284 0003 model-provider:
+    // `g = h ? h.sharedClient : buildClient(...)`): reuse one client per
+    // auth identity so the SDK/runtime keep-alive pool survives ACROSS
+    // queries — per-construction `new OpenAI()` rebuilt the connection pool
+    // for every concurrent subagent (full TCP+TLS handshake each, and
+    // chatgpt.com throttles concurrent handshakes hard: the "too many
+    // agents, connection very slow" shape). Token refresh changes the key
+    // → automatic rebuild. fetchOverride (test injection) bypasses cache.
+    const cacheKey = `${auth.accessToken}|${auth.accountId ?? ''}`
+    // fetch 身份纳入失效判定（见 cachedCodexClients 注释）。
+    const currentFetch = globalThis.fetch
+    let client: OpenAI
+    if (params.fetchOverride) {
+      client = buildCodexClient(auth, params.fetchOverride)
+    } else {
+      const cached = getCachedCodexClient(cacheKey, currentFetch)
+      if (cached) {
+        client = cached
+      } else {
+        client = buildCodexClient(auth)
+        storeCodexClient(cacheKey, client, currentFetch)
+      }
+    }
+    const created = await client.responses.create(
+      params.request as unknown as Parameters<
+        typeof client.responses.create
+      >[0],
+      { signal: watchdog.signal },
+    )
+    // Establishment succeeded — disarm the first-byte window before the
+    // consumption loop re-arms the idle window.
+    watchdog.markEstablished()
+    const stream = watchdog.wrap(
+      created as unknown as AsyncIterable<Record<string, unknown>>,
+    )
+    // Explicit ownership for callers that abandon before the generator starts.
+    // Generator.return() alone cannot run a suspendedStart generator's finally.
+    return Object.assign(stream, { dispose: () => watchdog.abort() })
+  } catch (error) {
+    // The wrapped stream was never handed out — nothing will settle the
+    // in-flight registry entry on our behalf.
+    watchdog.settle()
+    // Fail-closed classifiers key off the wrapped message shape — the SDK's
+    // raw APIError reads like "401 unauthorized" with no route context.
+    const status =
+      typeof error === 'object' && error !== null && 'status' in error
+        ? (error as { status?: unknown }).status
+        : undefined
+    throw new Error(
+      `ChatGPT Responses API request failed (${status ?? 'unknown'})`,
+      error instanceof Error ? { cause: error } : undefined,
+    )
+  }
+}

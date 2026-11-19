@@ -1,0 +1,69 @@
+{
+  "name": "@claude-code-hardened/workflow-engine",
+  "version": "0.1.0",
+  "description": "Deterministic JS script orchestration engine for multi-agent workflows. Zero core-layer runtime dependencies; talks to the world via port adapters.",
+  "type": "module",
+  "license": "MIT",
+  "author": "claude-code-best <claude-code-best@proton.me>",
+  "homepage": "https://github.com/claude-code-best/claude-code/tree/main/packages/workflow-engine#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/claude-code-best/claude-code.git",
+    "directory": "packages/workflow-engine"
+  },
+  "bugs": {
+    "url": "https://github.com/claude-code-best/claude-code/issues"
+  },
+  "keywords": [
+    "workflow",
+    "orchestration",
+    "multi-agent",
+    "claude",
+    "automation",
+    "scripting",
+    "deterministic"
+  ],
+  "main": "./src/index.ts",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "!src/**/__tests__",
+    "!src/**/*.test.ts",
+    "scripts/build.ts",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "ajv": "^8.18.0",
+    "zod": "^4.6.4"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.125.0",
+    "bun-types": "latest"
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "prepublishOnly": "bun run test && bun run build"
+  }
+}

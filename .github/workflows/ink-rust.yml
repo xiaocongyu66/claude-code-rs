@@ -1,0 +1,350 @@
+name: Ink Rust core and binding
+
+on:
+  push:
+    branches: [feat/ink-rust]
+    paths:
+      - 'packages/ink-rust/**'
+      - 'scripts/embeddedNativesPlugin.ts'
+      - 'scripts/compile.ts'
+      - 'src/utils/embeddedNative.ts'
+      - 'src/utils/embeddedNatives.gen.ts'
+      - '.github/workflows/ink-rust.yml'
+      - 'bun.lock'
+      - 'package.json'
+  pull_request:
+    paths:
+      - 'packages/ink-rust/**'
+      - 'scripts/embeddedNativesPlugin.ts'
+      - 'scripts/compile.ts'
+      - 'src/utils/embeddedNative.ts'
+      - 'src/utils/embeddedNatives.gen.ts'
+      - '.github/workflows/ink-rust.yml'
+      - 'bun.lock'
+      - 'package.json'
+  workflow_dispatch:
+    inputs:
+      bootstrap_lock:
+        description: 'Generate NAPI lock artifact only; NOT binding acceptance'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap-napi-lock:
+    name: NAPI lock bootstrap (NOT acceptance)
+    if: github.event_name == 'workflow_dispatch' && inputs.bootstrap_lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: '1.99.1'
+      - name: Generate lock and provenance only
+        run: |
+          test ! -e packages/ink-rust/native/napi/Cargo.lock
+          cargo generate-lockfile --manifest-path packages/ink-rust/native/napi/Cargo.toml
+          mkdir -p "$RUNNER_TEMP/ink-rust-napi-lock"
+          cp packages/ink-rust/native/napi/Cargo.lock "$RUNNER_TEMP/ink-rust-napi-lock/"
+          git rev-parse HEAD > "$RUNNER_TEMP/ink-rust-napi-lock/source-sha.txt"
+          rustc --version > "$RUNNER_TEMP/ink-rust-napi-lock/toolchain.txt"
+          cargo --version >> "$RUNNER_TEMP/ink-rust-napi-lock/toolchain.txt"
+          (cd "$RUNNER_TEMP/ink-rust-napi-lock" && sha256sum Cargo.lock > Cargo.lock.sha256)
+          echo 'Bootstrap only: no build, tests, Node/Bun smoke or binding acceptance.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ink-rust-napi-lock
+          path: ${{ runner.temp }}/ink-rust-napi-lock/
+          if-no-files-found: error
+
+  binding:
+    name: Linux NAPI binding (Node and Bun)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Require committed locks and clean baseline
+        run: |
+          git ls-files --error-unmatch bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+          git diff --exit-code HEAD -- bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: '1.99.1'
+          components: rustfmt, clippy
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.3'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Record toolchains
+        run: rustc --version && cargo --version && bun --version && node --version
+      - name: Install locked dependencies without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Strict package typecheck
+        run: bun node_modules/typescript/bin/tsc -p packages/ink-rust/tsconfig.json
+      - name: NAPI format (check only)
+        run: cargo fmt --manifest-path packages/ink-rust/native/napi/Cargo.toml --all -- --check
+      - name: NAPI clippy
+        run: cargo clippy --manifest-path packages/ink-rust/native/napi/Cargo.toml --locked --all-targets -- -D warnings
+      - name: NAPI tests
+        run: cargo test --manifest-path packages/ink-rust/native/napi/Cargo.toml --locked
+      - name: Build native binding
+        run: |
+          cargo build --manifest-path packages/ink-rust/native/napi/Cargo.toml --release --locked
+          cp packages/ink-rust/native/napi/target/release/libink_rust_napi.so "$RUNNER_TEMP/ink-rust-napi.node"
+      - name: Compile smoke for Node ESM
+        # Keep the tests directory as the module URL base; fixture and native paths
+        # are absolute argv values, never resolved relative to a relocated bundle.
+        run: bun build packages/ink-rust/tests/native-smoke.ts --target=node --format=esm --outfile=packages/ink-rust/tests/native-smoke.node.mjs
+      - name: Node native smoke (no fallback)
+        run: node packages/ink-rust/tests/native-smoke.node.mjs "$RUNNER_TEMP/ink-rust-napi.node" "$GITHUB_WORKSPACE/packages/ink-rust/fixtures/session-v1.json"
+      - name: Bun native smoke (no fallback)
+        run: bun packages/ink-rust/tests/native-smoke.ts "$RUNNER_TEMP/ink-rust-napi.node" "$GITHUB_WORKSPACE/packages/ink-rust/fixtures/session-v1.json"
+      - name: Build Bun-target ESM smoke bundle
+        timeout-minutes: 3
+        run: |
+          mkdir -p "$RUNNER_TEMP/ink-rust-bun-bundle"
+          bun build packages/ink-rust/tests/native-smoke.ts --target=bun --format=esm --outfile="$RUNNER_TEMP/ink-rust-bun-bundle/native-smoke.mjs"
+      - name: Bun bundle native smoke (external artifact, no fallback)
+        timeout-minutes: 3
+        # 独立 cwd 排除仓库相对路径依赖；复用外置 .node 与绝对 fixture 路径。
+        run: |
+          smoke_cwd="$(mktemp -d "$RUNNER_TEMP/ink-rust-bundle-cwd.XXXXXX")"
+          cd "$smoke_cwd"
+          bun "$RUNNER_TEMP/ink-rust-bun-bundle/native-smoke.mjs" "$RUNNER_TEMP/ink-rust-napi.node" "$GITHUB_WORKSPACE/packages/ink-rust/fixtures/session-v1.json"
+      - name: Compile Bun native smoke executable
+        timeout-minutes: 5
+        # 使用本机 Linux 目标；此处不内嵌 .node，不代表独立单文件发布验收。
+        run: |
+          mkdir -p "$RUNNER_TEMP/ink-rust-bun-compile"
+          bun build packages/ink-rust/tests/native-smoke.ts --compile --format=esm --outfile="$RUNNER_TEMP/ink-rust-bun-compile/native-smoke"
+      - name: Bun compiled native smoke (external artifact, no fallback)
+        timeout-minutes: 3
+        # 同一 smoke 验证 argv[2]/argv[3]、虚拟模块路径加载及 missing artifact 断言。
+        run: |
+          smoke_cwd="$(mktemp -d "$RUNNER_TEMP/ink-rust-compile-cwd.XXXXXX")"
+          cd "$smoke_cwd"
+          "$RUNNER_TEMP/ink-rust-bun-compile/native-smoke" "$RUNNER_TEMP/ink-rust-napi.node" "$GITHUB_WORKSPACE/packages/ink-rust/fixtures/session-v1.json"
+      - name: Build real embedded native smoke executables
+        timeout-minutes: 5
+        run: |
+          evidence="$RUNNER_TEMP/ink-rust-embedded-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD > "$evidence/source-sha.txt"
+          { rustc --version; cargo --version; bun --version; node --version; uname -a; } > "$evidence/toolchain.txt"
+          bun packages/ink-rust/tests/build-embedded-native-smoke.ts "$RUNNER_TEMP/ink-rust-napi.node" "$RUNNER_TEMP/ink-rust-embedded-bin" "$evidence"
+      - name: Real embedded native smoke (memfd provenance and strict rejection)
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          evidence="$RUNNER_TEMP/ink-rust-embedded-evidence"
+          for mode in valid missing invalid; do
+            smoke_cwd="$(mktemp -d "$RUNNER_TEMP/ink-rust-embedded-$mode.XXXXXX")"
+            mv "$RUNNER_TEMP/ink-rust-embedded-bin/$mode" "$smoke_cwd/smoke"
+            if (cd "$smoke_cwd" && timeout 45s ./smoke) > "$evidence/$mode.stdout" 2> "$evidence/$mode.stderr"; then
+              code=0
+            else
+              code=$?
+            fi
+            printf '%s\n' "$code" > "$evidence/$mode.exit-code.txt"
+            case "$mode" in
+              valid)
+                test "$code" -eq 0
+                grep -Fq '"result":"EMBEDDED_SMOKE_VALID"' "$evidence/$mode.stdout"
+                ;;
+              missing)
+                test "$code" -eq 42
+                grep -Fxq 'EMBEDDED_SMOKE_REJECTED_MISSING: loader returned null' "$evidence/$mode.stderr"
+                ;;
+              invalid)
+                test "$code" -eq 43
+                grep -Fxq 'EMBEDDED_SMOKE_REJECTED_INVALID: loader returned null' "$evidence/$mode.stderr"
+                ;;
+            esac
+          done
+      - name: Upload embedded native evidence (no binaries)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ink-rust-embedded-evidence
+          path: ${{ runner.temp }}/ink-rust-embedded-evidence/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Verify locks unchanged
+        if: always()
+        run: git diff --exit-code HEAD -- bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+
+  cross-platform-binding:
+    name: Native loading (${{ matrix.platform }} ${{ matrix.arch }}, Node and Bun)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+            rust-host: aarch64-apple-darwin
+          - os: windows-2022
+            platform: win32
+            arch: x64
+            rust-host: x86_64-pc-windows-msvc
+    env:
+      EXPECTED_PLATFORM: ${{ matrix.platform }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+      EXPECTED_RUST_HOST: ${{ matrix.rust-host }}
+    # 仅验收本机原生加载；不涵盖两平台的 Bun compile 或 PTY。
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Require committed locks and clean baseline (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          git ls-files --error-unmatch bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+          git diff --exit-code HEAD -- bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+      - name: Require committed locks and clean baseline (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          git ls-files --error-unmatch bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code HEAD -- bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: '1.99.1'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.3'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - name: Assert native runtime architecture and Rust host (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          node -e 'const a = require("node:assert/strict"); a.equal(process.platform, process.env.EXPECTED_PLATFORM); a.equal(process.arch, process.env.EXPECTED_ARCH); console.log(process.version, process.platform, process.arch)'
+          bun -e 'const a = require("node:assert/strict"); a.equal(process.platform, process.env.EXPECTED_PLATFORM); a.equal(process.arch, process.env.EXPECTED_ARCH); console.log(Bun.version, process.platform, process.arch)'
+          rust_info="$(rustc -vV)"
+          printf '%s\n' "$rust_info"
+          [[ "$rust_info" == *$'\nhost: '"$EXPECTED_RUST_HOST"$'\n'* ]]
+      - name: Assert native runtime architecture and Rust host (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          node -e 'const a = require("node:assert/strict"); a.equal(process.platform, process.env.EXPECTED_PLATFORM); a.equal(process.arch, process.env.EXPECTED_ARCH); console.log(process.version, process.platform, process.arch)'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun -e 'const a = require("node:assert/strict"); a.equal(process.platform, process.env.EXPECTED_PLATFORM); a.equal(process.arch, process.env.EXPECTED_ARCH); console.log(Bun.version, process.platform, process.arch)'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $rustInfo = rustc -vV
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $rustInfo
+          $hostLines = @($rustInfo | Where-Object { $_ -clike 'host:*' })
+          if ($hostLines.Count -ne 1 -or $hostLines[0] -cne "host: $env:EXPECTED_RUST_HOST") { throw 'Unexpected Rust host' }
+      - name: Install locked dependencies without lifecycle scripts (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 5
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install locked dependencies without lifecycle scripts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: NAPI tests and native release build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          cargo test --manifest-path packages/ink-rust/native/napi/Cargo.toml --locked
+          cargo build --manifest-path packages/ink-rust/native/napi/Cargo.toml --release --locked
+          cp packages/ink-rust/native/napi/target/release/libink_rust_napi.dylib "$RUNNER_TEMP/ink-rust-napi.node"
+      - name: NAPI tests and native release build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          cargo test --manifest-path packages/ink-rust/native/napi/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --manifest-path packages/ink-rust/native/napi/Cargo.toml --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $library = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'packages/ink-rust/native/napi/target/release/ink_rust_napi.dll')).Path
+          Copy-Item -LiteralPath $library -Destination (Join-Path $env:RUNNER_TEMP 'ink-rust-napi.node') -ErrorAction Stop
+      - name: Node ESM and Bun TS native smoke (macOS, no fallback)
+        if: runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          bun build packages/ink-rust/tests/native-smoke.ts --target=node --format=esm --outfile=packages/ink-rust/tests/native-smoke.node.mjs
+          node "$GITHUB_WORKSPACE/packages/ink-rust/tests/native-smoke.node.mjs" "$RUNNER_TEMP/ink-rust-napi.node" "$GITHUB_WORKSPACE/packages/ink-rust/fixtures/session-v1.json"
+          bun "$GITHUB_WORKSPACE/packages/ink-rust/tests/native-smoke.ts" "$RUNNER_TEMP/ink-rust-napi.node" "$GITHUB_WORKSPACE/packages/ink-rust/fixtures/session-v1.json"
+      - name: Node ESM and Bun TS native smoke (Windows, no fallback)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $source = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'packages/ink-rust/tests/native-smoke.ts')).Path
+          $bundle = Join-Path $env:GITHUB_WORKSPACE 'packages/ink-rust/tests/native-smoke.node.mjs'
+          $artifact = (Resolve-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'ink-rust-napi.node')).Path
+          $fixture = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'packages/ink-rust/fixtures/session-v1.json')).Path
+          bun build "$source" --target=node --format=esm "--outfile=$bundle"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node "$bundle" "$artifact" "$fixture"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun "$source" "$artifact" "$fixture"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify locks unchanged (macOS)
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 2
+        run: git diff --exit-code HEAD -- bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+      - name: Verify locks unchanged (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          git diff --exit-code HEAD -- bun.lock packages/ink-rust/native/Cargo.lock packages/ink-rust/native/napi/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/ink-rust/native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # 版本依据：本仓库成功 CI run 41384740282 的 rustc 日志；固定 SHA 不等于固定 stable 版本。
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: '1.99.1'
+          components: rustfmt, clippy
+      - name: Binding acceptance status
+        run: |
+          echo 'Core-only gate; NAPI acceptance is enforced independently by the Linux binding job.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Record toolchain
+        run: rustc --version && cargo --version
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Deterministic scene example
+        run: |
+          cargo run --quiet --locked -p ink-rust-core --example scene > "$RUNNER_TEMP/ink-rust-scene.actual"
+          diff -u core/examples/scene.expected "$RUNNER_TEMP/ink-rust-scene.actual"
