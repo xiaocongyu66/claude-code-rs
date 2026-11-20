@@ -71,7 +71,7 @@ mod tests {
     fn coerces_numeric_strings() {
         assert_eq!(parse_semantic_number(&json!("30")), Some(30.0));
         assert_eq!(parse_semantic_number(&json!("-5")), Some(-5.0));
-        assert_eq!(parse_semantic_number(&json!("3.14")), Some(3.14));
+        assert_eq!(parse_semantic_number(&json!("3.15")), Some(3.15));
         assert_eq!(parse_semantic_number(&json!(42)), Some(42.0));
     }
 
