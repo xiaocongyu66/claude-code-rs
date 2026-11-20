@@ -11,8 +11,6 @@
 //! - `shortErrorStack`：Rust 无 V8 式 stack 字符串，返回 `{:?}` 的精简
 //!   形式（错误链），栈回溯后续按需通过 backtrace 特性引入。
 
-use std::fmt;
-
 use thiserror::Error;
 
 /// 基类等价物：带消息的通用错误（TS `ClaudeError`）。
@@ -283,12 +281,6 @@ pub fn error_message(e: &(dyn std::error::Error + 'static)) -> String {
 /// 需要通过 backtrace 特性引入。`max_frames` 参数为兼容保留。
 pub fn short_error_stack(e: &(dyn std::error::Error + 'static), _max_frames: usize) -> String {
     format!("{e:?}")
-}
-
-impl fmt::Display for MalformedCommandError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
 }
 
 #[cfg(test)]
