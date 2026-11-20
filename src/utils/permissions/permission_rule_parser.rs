@@ -178,11 +178,7 @@ pub fn permission_rule_value_from_string(rule_string: &str) -> PermissionRuleVal
 pub fn permission_rule_value_to_string(rule_value: &PermissionRuleValue) -> String {
     match &rule_value.rule_content {
         None => rule_value.tool_name.clone(),
-        Some(content) => format!(
-            "{}({})",
-            rule_value.tool_name,
-            escape_rule_content(content)
-        ),
+        Some(content) => format!("{}({})", rule_value.tool_name, escape_rule_content(content)),
     }
 }
 
@@ -247,7 +243,10 @@ mod tests {
 
     #[test]
     fn escapes_and_unescapes_content() {
-        assert_eq!(escape_rule_content("psycopg2.connect()"), "psycopg2.connect\\(\\)");
+        assert_eq!(
+            escape_rule_content("psycopg2.connect()"),
+            "psycopg2.connect\\(\\)"
+        );
         assert_eq!(
             escape_rule_content("echo \"test\\nvalue\""),
             "echo \"test\\\\nvalue\""

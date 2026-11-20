@@ -84,14 +84,20 @@ mod tests {
         let content = vec![
             serde_json::json!({ "type": "text", "text": "hi" }),
             tool_use("other", serde_json::json!({})),
-            tool_use("classify_result", serde_json::json!({ "decision": "allow" })),
+            tool_use(
+                "classify_result",
+                serde_json::json!({ "decision": "allow" }),
+            ),
         ];
         let block = extract_tool_use_block(&content, "classify_result");
         assert!(block.is_some());
-        let parsed: Option<ClassifierOutput> = parse_classifier_response(&block.unwrap_or(Value::Null));
+        let parsed: Option<ClassifierOutput> =
+            parse_classifier_response(&block.unwrap_or(Value::Null));
         assert_eq!(
             parsed,
-            Some(ClassifierOutput { decision: "allow".to_string() })
+            Some(ClassifierOutput {
+                decision: "allow".to_string()
+            })
         );
     }
 

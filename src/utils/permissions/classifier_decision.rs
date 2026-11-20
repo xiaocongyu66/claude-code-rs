@@ -54,7 +54,7 @@ pub const SAFE_YOLO_ALLOWLISTED_TOOLS: &[&str] = &[
     // 杂项安全工具
     "Sleep",
     // ant-only 工具（TS 侧 gates mirror tools.ts）：
-    "TerminalCapture", // feature('TERMINAL_PANEL')
+    "TerminalCapture",     // feature('TERMINAL_PANEL')
     "VerifyPlanExecution", // process.env.USER_TYPE === 'ant'
     // 内部分类器工具（YOLO_CLASSIFIER_TOOL_NAME = 'classify_result'）
     "classify_result",

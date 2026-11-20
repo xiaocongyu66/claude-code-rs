@@ -8,3 +8,9 @@ pub mod permission_result;
 pub mod permission_rule;
 pub mod permission_update_schema;
 pub mod shell_rule_matching;
+
+pub mod classifier_shared;
+pub mod classifier_decision;
+pub mod permission_rule_parser;
+pub mod permissions_loader;
+pub mod permission_update;
