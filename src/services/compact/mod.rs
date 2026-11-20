@@ -81,7 +81,7 @@ impl Content {
 
 /// `SystemCompactBoundaryMessage.compactMetadata`。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields = false)]
+#[serde(default, rename_all = "camelCase")]
 pub struct CompactMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,

@@ -45,14 +45,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::bootstrap::state::{get_is_non_interactive_session, get_session_id, get_session_trust_accepted};
-use crate::constants::keys::get_growth_book_client_key;
+use crate::constants::keys::get_growthbook_client_key;
 use crate::utils::auth::{check_has_trust_dialog_accepted, get_rate_limit_tier, get_subscription_type};
 use crate::utils::debug::{log_for_debugging, DebugLogLevel};
 use crate::utils::log::log_error;
 use crate::utils::platform::{get_platform, Platform};
 use crate::utils::signal::{Signal, Subscription};
 
-use super::first_party_event_logger::log_growth_book_experiment_to_1p;
+use super::first_party_event_logger::log_growthbook_experiment_to_1p;
 
 /// 用户属性（TS `GrowthBookUserAttributes`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -540,7 +540,7 @@ fn create_growth_book_client() -> Option<GrowthBookClient> {
         log_for_debugging(
             &format!(
                 "GrowthBook: Creating client (clientKey={}, adapter={}, auth={})",
-                get_growth_book_client_key(),
+                get_growthbook_client_key(),
                 is_adapter_mode,
                 has_auth
             ),
@@ -550,7 +550,7 @@ fn create_growth_book_client() -> Option<GrowthBookClient> {
     Some(GrowthBookClient {
         base_url: std::env::var("CLAUDE_GB_ADAPTER_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com/".to_string()),
-        client_key: get_growth_book_client_key(),
+        client_key: get_growthbook_client_key(),
         remote_eval: !is_adapter_mode,
     })
 }
@@ -606,7 +606,7 @@ fn log_exposure_for_feature(feature: &str) {
         let user_attributes = get_user_attributes();
         let mut experiment_metadata = serde_json::Map::new();
         experiment_metadata.insert("feature_id".into(), Value::String(feature.to_string()));
-        log_growth_book_experiment_to_1p(&super::first_party_event_logger::GrowthBookExperimentData {
+        log_growthbook_experiment_to_1p(&super::first_party_event_logger::GrowthBookExperimentData {
             experiment_id: exp_data.experiment_id,
             variation_id: exp_data.variation_id,
             user_attributes: Some(user_attributes),

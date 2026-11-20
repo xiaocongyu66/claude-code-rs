@@ -4,7 +4,7 @@ pub mod api;
 pub mod analytics;
 pub mod auth;
 pub mod compact;
-pub mod context_collapse;
+pub mod contextCollapse;
 pub mod internal_logging;
 pub mod native_token_cache;
 pub mod notifier;

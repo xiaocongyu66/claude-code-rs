@@ -79,7 +79,7 @@ impl QuotaStatus {
     }
 
     #[allow(dead_code)]
-    fn as_str(self) -> 'static str {
+    fn as_str(self) -> &'static str {
         match self {
             QuotaStatus::Allowed => "allowed",
             QuotaStatus::AllowedWarning => "allowed_warning",
@@ -149,7 +149,7 @@ impl OverageDisabledReason {
     }
 
     #[allow(dead_code)]
-    fn as_str(self) -> 'static str {
+    fn as_str(self) -> &'static str {
         match self {
             OverageDisabledReason::OverageNotProvisioned => "overage_not_provisioned",
             OverageDisabledReason::OrgLevelDisabled => "org_level_disabled",
