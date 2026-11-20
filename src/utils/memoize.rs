@@ -144,7 +144,8 @@ where
             return Ok(stale_value);
         }
 
-        Ok(unlocked(&entry).value.clone())
+        let value = unlocked(&entry).value.clone();
+        Ok(value)
     }
 
     /// 清空缓存（对齐 `memoized.cache.clear()`）。
