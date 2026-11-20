@@ -118,8 +118,10 @@ const STRING_FORMATS_DATE: (&str, &str) = ("date", "2024-03-15");
 const STRING_FORMATS_DATE_TIME: (&str, &str) = ("date-time", "2024-03-15T14:30:00Z");
 
 static EMAIL_RE: Lazy<Option<Regex>> = Lazy::new(|| {
+    // rust regex 不支持 look-around：去掉 TS 正则的前瞻断言（开头非点 /
+    // 无连续点），改由运行时两个前置检查补齐（见 email 校验入口）
     Regex::new(
-        r"^(?!\.)(?!.*\.\.)([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$",
+        r"^([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$",
     )
     .ok()
 });
@@ -331,7 +333,10 @@ pub fn validate_elicitation_input(
         }
         match schema.format.as_deref() {
             Some("email") => {
-                if !is_match(&EMAIL_RE, string_value) {
+                // 补齐 TS 前瞻断言语义：不得以点开头、不得含连续点
+                if string_value.starts_with('.') || string_value.contains("..")
+                    || !is_match(&EMAIL_RE, string_value)
+                {
                     errors.push(
                         "Must be a valid email address, e.g. user@example.com".to_string(),
                     );

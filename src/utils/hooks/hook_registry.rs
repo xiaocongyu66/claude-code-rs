@@ -288,7 +288,7 @@ pub async fn dispatch_main_thread_hook_event(
         let id = hook.id.clone();
         let callback = hook.callback.clone();
         let payload = Arc::new(payload.clone());
-        let join = tokio::task::spawn(async move { callback(&payload) }).await;
+        let join = tokio::task::spawn(async move { callback(&payload).await }).await;
         match join {
             Ok(Some(verdict)) => dispatch_results.push(MainThreadHookDispatchResult {
                 hook: name,

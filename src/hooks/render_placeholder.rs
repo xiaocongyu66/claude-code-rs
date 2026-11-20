@@ -129,7 +129,7 @@ pub fn render_placeholder(props: &PlaceholderRendererProps<'_>) -> RenderedPlace
 mod tests {
     use super::*;
 
-    fn props(placeholder: Option<&str>, value: &str) -> PlaceholderRendererProps<'_> {
+    fn props<'a>(placeholder: Option<&'a str>, value: &'a str) -> PlaceholderRendererProps<'a> {
         PlaceholderRendererProps {
             placeholder,
             value,

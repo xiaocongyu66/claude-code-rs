@@ -144,7 +144,7 @@ static ALL_HOOK_EVENTS_ENABLED: Mutex<bool> = Mutex::new(false);
 pub fn register_hook_event_handler(handler: Option<HookEventHandler>) {
     let drained: Vec<HookExecutionEvent> = {
         let mut handler_guard = lock(&EVENT_HANDLER);
-        handler_guard.replace(handler.clone());
+        *handler_guard = handler.clone();
         if handler.is_some() {
             std::mem::take(&mut *lock(&PENDING_EVENTS))
         } else {

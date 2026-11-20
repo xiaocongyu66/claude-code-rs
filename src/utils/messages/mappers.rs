@@ -459,7 +459,7 @@ pub fn local_command_output_to_sdk_assistant_message(raw_content: &str, uuid: &s
 
 /// `content.replace(pattern, '$1')`：仅首次匹配，失败（正则不编译）时
 /// 返回原文。
-fn replace_first_tag(content: &str, pattern: &str) -> Cow<'_, str> {
+fn replace_first_tag<'a>(content: &'a str, pattern: &str) -> Cow<'a, str> {
     match Regex::new(pattern) {
         Ok(re) => re.replace(content, "$1"),
         Err(_) => Cow::Borrowed(content),

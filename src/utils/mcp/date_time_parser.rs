@@ -142,7 +142,7 @@ pub async fn parse_natural_language_date_time(
         has_pending_mcp_servers: false,
     };
 
-    let result = match query_haiku(&user_prompt, &system_prompt, None, &options).await {
+    let result = match query_haiku(&user_prompt, &system_prompt.0, None, &options).await {
         Ok(message) => message,
         Err(error) => {
             // 记录错误但不向用户暴露细节
