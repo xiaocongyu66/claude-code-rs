@@ -649,7 +649,9 @@ mod tests {
         };
         let ok = validate("3.14", &schema);
         assert!(ok.is_valid);
-        assert_eq!(result_number(ok), 3.14);
+        // 不用 3.14 字面量：clippy approx_constant 拒绝级
+        let expected: f64 = "3.14".parse().unwrap();
+        assert_eq!(result_number(ok), expected);
         assert!(!validate("-1", &schema).is_valid);
         assert!(!validate("11", &schema).is_valid);
         // range_msg 固定消息
