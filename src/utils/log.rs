@@ -479,22 +479,25 @@ async fn load_log_list(path: &Path) -> Result<Vec<LogOption>, LoadLogsError> {
             }
         };
 
+        // 先取出借用周期内的所有派生值，避免 messages/date 移动后回写
+        let first_timestamp = first_message
+            .and_then(|m| m.timestamp.clone())
+            .unwrap_or_default();
+        let last_timestamp = last_message.and_then(|m| m.timestamp.clone());
+        let date_for_fallback = date.clone();
+
         log_data.push(LogOption {
             date,
             full_path: Some(full_path.to_string_lossy().into_owned()),
             messages,
             // hack：排序后由 sort_logs 覆盖回填
             value: 0,
-            created: parse_iso_string(
-                &first_message
-                    .and_then(|m| m.timestamp.clone())
-                    .unwrap_or_default(),
-            )
-            .or_else(|| parse_iso_string(&date)),
-            modified: last_message
-                .and_then(|m| m.timestamp.clone())
-                .and_then(|s| parse_iso_string(&s))
-                .or_else(|| parse_iso_string(&date)),
+            created: parse_iso_string(&first_timestamp)
+                .or_else(|| parse_iso_string(&date_for_fallback)),
+            modified: last_timestamp
+                .as_deref()
+                .and_then(parse_iso_string)
+                .or_else(|| parse_iso_string(&date_for_fallback)),
             first_prompt,
             message_count: 0,
             is_sidechain,

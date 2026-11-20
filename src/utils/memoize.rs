@@ -129,7 +129,7 @@ where
                         }
                     }
                     Err(e) => {
-                        crate::utils::log::log_error_dyn(&*e);
+                        crate::utils::log::log_error_dyn(e);
                         let mut guard = unlocked(&cache);
                         if let Some(current) = guard.get(&key) {
                             if Arc::ptr_eq(current, &entry) {
@@ -286,7 +286,7 @@ where
                     }
                 }
                 Err(e) => {
-                    crate::utils::log::log_error_dyn(&*e);
+                    crate::utils::log::log_error_dyn(e);
                     let mut guard = unlocked(&cache);
                     if let Some(current) = guard.get(&key) {
                         if Arc::ptr_eq(current, &entry) {
@@ -525,7 +525,8 @@ mod tests {
             },
             1000,
         );
-        let (a, b) = tokio::join!(m.call(&"k".to_string()), m.call(&"k".to_string()));
+        let key = "k".to_string();
+        let (a, b) = tokio::join!(m.call(&key), m.call(&key));
         assert_eq!(a.unwrap(), "done");
         assert_eq!(b.unwrap(), "done");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
