@@ -24,7 +24,6 @@ pub async fn which(command: &str) -> Option<String> {
             .stderr(Stdio::null())
             .stdout(Stdio::piped())
             .output()
-            .await
             .ok()?;
         if !output.status.success() || output.stdout.is_empty() {
             return None;
@@ -43,7 +42,6 @@ pub async fn which(command: &str) -> Option<String> {
             .stderr(Stdio::null())
             .stdout(Stdio::piped())
             .output()
-            .await
             .ok()?;
         if !output.status.success() || output.stdout.is_empty() {
             return None;

@@ -355,6 +355,12 @@ async fn query_loop(
         let mut needs_follow_up = false;
         let mut last_is_api_error = false;
 
+        // `tool::ThinkingConfig` 尚为 `Value` 占位，反序列化为 wire 枚举；
+        // 形状不匹配时按 Disabled 处理（对齐 TS 默认不开启思考）。
+        let thinking_config: ThinkingConfig =
+            serde_json::from_value(ctx.options.thinking_config.clone())
+                .unwrap_or(ThinkingConfig::Disabled);
+
         // ---- 流式请求 + 模型回退重试 ----
         let mut attempt_with_fallback = true;
         while attempt_with_fallback {
@@ -380,7 +386,7 @@ async fn query_loop(
                     ModelRequest {
                         messages: req_messages,
                         system: system_blocks,
-                        thinking_config: &ctx.options.thinking_config,
+                        thinking_config: &thinking_config,
                         tools: tool_params(&ctx.options.tools),
                         options,
                     },

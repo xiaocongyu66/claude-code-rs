@@ -1142,8 +1142,8 @@ pub struct MessageStreamParams {
 impl MessageStreamParams {
     /// 序列化为请求体 JSON：extra_body 字段覆盖计算字段（对齐 TS 展开）。
     pub fn into_request_body(self) -> Value {
-        let extra_body = self.extra_body;
         let mut value = serde_json::to_value(&self).unwrap_or(Value::Null);
+        let extra_body = self.extra_body;
         if !extra_body.is_empty() {
             if let Value::Object(map) = &mut value {
                 for (k, v) in extra_body {
@@ -1699,6 +1699,7 @@ pub fn strip_excess_media_items(messages: &[Message], limit: u32) -> Vec<Message
                                 true
                             }
                         })
+                        .cloned()
                         .collect();
                     if filtered.len() == nested.len() {
                         block.clone()
@@ -2414,7 +2415,7 @@ pub fn is_non_custom_opus_model(model: &str) -> bool {
         ModelKey::Opus47,
     ]
     .iter()
-    .any(|key| *model == model_string(**key))
+    .any(|key| *model == model_string(*key))
 }
 
 /// 判断 querySource 为 agentic（`repl_main_thread*` / `agent:*` /

@@ -41,7 +41,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -1390,7 +1390,9 @@ pub async fn get_api_key_from_api_key_helper(is_non_interactive: bool) -> AuthRe
         return Ok(entry.value);
     }
     // 冷缓存：并发去重。
-    if let Some(tx) = lock(&API_KEY_HELPER_INFLIGHT).as_ref().cloned() {
+    // 注意：lock guard 不能跨 await（非 Send），先取出 tx 再进 if-let。
+    let inflight_tx = lock(&API_KEY_HELPER_INFLIGHT).as_ref().cloned();
+    if let Some(tx) = inflight_tx {
         let mut rx = tx.subscribe();
         loop {
             if let Some(result) = &*rx.borrow() {
@@ -2082,8 +2084,8 @@ impl Drop for LockGuard {
 }
 
 /// 401 in-flight 去重：watch channel 广播结果（key = 失败的 access token）。
-static PENDING_401: Mutex<HashMap<String, watch::Sender<Option<AuthResult<bool>>>>> =
-    Mutex::new(HashMap::new());
+static PENDING_401: LazyLock<Mutex<HashMap<String, watch::Sender<Option<AuthResult<bool>>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// TS `handleOAuth401Error`：服务端说过期就强制刷新（本地判定分歧时也照做）。
 /// 同 token 的并发调用去重为一次存储读 + 刷新。
@@ -2296,7 +2298,8 @@ pub fn get_oauth_account_info() -> Option<OauthAccountInfo> {
     if !is_anthropic_auth_enabled() {
         return None;
     }
-    let account = get_global_config().get("oauthAccount")?;
+    let config = get_global_config();
+    let account = config.get("oauthAccount")?;
     serde_json::from_value(account.clone()).ok()
 }
 
@@ -2504,18 +2507,18 @@ pub fn get_account_information() -> Option<UserAccountInfo> {
     match auth_token_source {
         AuthTokenSource::ClaudeCodeOauthToken
         | AuthTokenSource::ClaudeCodeOauthTokenFileDescriptor => {
-            account_info.token_source = Some(auth_token_source);
+            account_info.token_source = Some(auth_token_source.clone());
         }
         _ if is_claude_ai_subscriber() => {
             account_info.subscription = Some(get_subscription_name());
         }
         _ => {
-            account_info.token_source = Some(auth_token_source);
+            account_info.token_source = Some(auth_token_source.clone());
         }
     }
     let (api_key, api_key_source) = get_anthropic_api_key_with_source(GetApiKeyOpts::default());
     if api_key.is_some() {
-        account_info.api_key_source = Some(api_key_source);
+        account_info.api_key_source = Some(api_key_source.clone());
     }
     let oauth_account = get_oauth_account_info();
     let managed_credentials = auth_token_source == AuthTokenSource::ClaudeAi
@@ -2647,7 +2650,7 @@ mod tests {
     #[test]
     fn expiry_buffer_and_none() {
         assert!(!is_oauth_token_expired(None));
-        let far_future = now_ms() + 3600_000;
+        let far_future = now_ms() + 3_600_000;
         assert!(!is_oauth_token_expired(Some(far_future)));
         let near = now_ms() + 60_000;
         assert!(is_oauth_token_expired(Some(near)));

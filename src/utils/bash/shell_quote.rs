@@ -17,7 +17,7 @@
 //!   （claude-code 唯一的函数 env 用法只返回字符串，该路径不被触发）。
 //! - `parse` 的 opts（escape / splitUnquoted）未实现：claude-code 无调用方使用，
 //!   相应的 pendingNw / flushRun / words 分支一并省略。
-//! - TS 的 `logError(error)` 对齐为 `log::log_error(anyhow!(msg))`；抛错改为
+//! - TS 的 `logError(error)` 对齐为 `log::log_error(io::Error::new(Other, msg))`；抛错改为
 //!   `ShellParseResult::Failed` / `ShellQuoteResult::Failed`。
 //! - JS 字符串下标按 UTF-16 code unit 计，Rust 按标量值（char）扫描；BMP 字符
 //!   完全一致，astral 字符（emoji 等）在 `parseEnvVar` 的 `i+1` 推进处有细微差异。
@@ -243,7 +243,14 @@ pub fn quote_tokens(xs: &[ParseEntry]) -> Result<String, String> {
                     parts.push(format!("'{}'", s));
                 } else if has_space_or_quote(s) {
                     // 分支 3：含 " / ' / 空白 → 双引号，转义 " \ $ `（不转义 !）。
-                    let escaped = s.replace(['"', '\\', '$', '`'], |c| format!("\\{}", c));
+                    // 对齐 quote.js 的 `s.replace(/(["\\$`])/g, '\\$1')`：逐字符加反斜杠。
+                    let mut escaped = String::with_capacity(s.len() * 2);
+                    for c in s.chars() {
+                        if matches!(c, '"' | '\\' | '$' | '`') {
+                            escaped.push('\\');
+                        }
+                        escaped.push(c);
+                    }
                     parts.push(format!("\"{}\"", escaped));
                 } else {
                     // 分支 4：逐字符转义；Windows 盘符 `C:` 前缀豁免（保留原样）。
@@ -1040,11 +1047,11 @@ fn parse_shell(string: &str, env: Option<&ShellEnv<'_>>) -> Result<Vec<ParseEntr
 
 /// tryParseShellCommand：安全包装，失败时 logError 并返回失败结果。
 pub fn try_parse_shell_command(cmd: &str, env: Option<ShellEnv<'_>>) -> ShellParseResult {
-    match parse_shell(cmd, env) {
+    match parse_shell(cmd, env.as_ref()) {
         Ok(tokens) => ShellParseResult::Success { tokens },
         Err(error) => {
             // TS：if (error instanceof Error) logError(error)。
-            log_error(anyhow::anyhow!(error.clone()));
+            log_error(std::io::Error::new(std::io::ErrorKind::Other, error.clone()));
             ShellParseResult::Failed { error }
         }
     }
@@ -1057,7 +1064,7 @@ pub fn try_quote_shell_args(args: &[String]) -> ShellQuoteResult {
     match quote_tokens(&tokens) {
         Ok(quoted) => ShellQuoteResult::Success { quoted },
         Err(error) => {
-            log_error(anyhow::anyhow!(error.clone()));
+            log_error(std::io::Error::new(std::io::ErrorKind::Other, error.clone()));
             ShellQuoteResult::Failed { error }
         }
     }
@@ -1084,4 +1091,131 @@ pub fn quote(args: &[String]) -> String {
         .map(|a| format!("'{}'", a.replace('\'', "'\"'\"'")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 畸形 token 检测（shellQuote.ts）
+// ────────────────────────────────────────────────────────────────────────────
+
+/// 统计 token 中未被反斜杠转义的引号数量（对齐 TS `(?<!\\)"/g`）。
+fn count_unescaped(s: &str, quote: char) -> usize {
+    let mut count = 0usize;
+    let mut prev: Option<char> = None;
+    for c in s.chars() {
+        if c == quote && prev != Some('\\') {
+            count += 1;
+        }
+        prev = Some(c);
+    }
+    count
+}
+
+/// hasMalformedTokens：检测 shell-quote 误解析产生的畸形 token。
+///
+/// 两类检查：
+/// 1. 原始命令中存在未闭合引号（shell-quote 会静默丢弃不匹配的引号，
+///    token 层面无痕迹，须回查原始串，按 bash 引号语义扫描奇偶校验）；
+/// 2. token 本身括号/引号不平衡（JSON 类歧义输入被 shell 规则拆碎，
+///    如 `echo {"hi":"hi;evil"}`）。
+pub fn has_malformed_tokens(command: &str, parsed: &[ParseEntry]) -> bool {
+    // 检查 1：按 bash 语义扫描原始命令——单引号内反斜杠无转义作用。
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut double_count = 0u32;
+    let mut single_count = 0u32;
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && !in_single {
+            i += 2;
+            continue;
+        }
+        if c == '"' && !in_single {
+            double_count += 1;
+            in_double = !in_double;
+        } else if c == '\'' && !in_double {
+            single_count += 1;
+            in_single = !in_single;
+        }
+        i += 1;
+    }
+    if double_count % 2 != 0 || single_count % 2 != 0 {
+        return true;
+    }
+
+    // 检查 2：字符串 token 的括号/引号平衡性。
+    for entry in parsed {
+        let ParseEntry::Str(s) = entry else {
+            continue;
+        };
+        if s.matches('{').count() != s.matches('}').count() {
+            return true;
+        }
+        if s.matches('(').count() != s.matches(')').count() {
+            return true;
+        }
+        if s.matches('[').count() != s.matches(']').count() {
+            return true;
+        }
+        if count_unescaped(s, '"') % 2 != 0 {
+            return true;
+        }
+        if count_unescaped(s, '\'') % 2 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// hasShellQuoteSingleQuoteBug：检测利用 shell-quote 单引号内反斜杠
+/// 处理错误的 `\` 模式。
+///
+/// bash 中单引号保留所有字符字面值（反斜杠无特殊含义），而 shell-quote
+/// 的 chunker 正则把 `\'` 当作转义，导致 `'\' <payload> '\''` 把 payload
+/// 藏进一个 shell-quote 误判的单一引号串。
+pub fn has_shell_quote_single_quote_bug(command: &str) -> bool {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (byte_pos, c) = chars[idx];
+        if c == '\\' && !in_single_quote {
+            // 单引号外反斜杠转义下一字符。
+            idx += 2;
+            continue;
+        }
+        if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            idx += 1;
+            continue;
+        }
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            if !in_single_quote {
+                // 刚闭合一个单引号；统计其前方连续反斜杠数量。
+                let mut backslash_count = 0usize;
+                let mut j = idx as isize - 1;
+                while j >= 0 && chars[j as usize].1 == '\\' {
+                    backslash_count += 1;
+                    j -= 1;
+                }
+                // 奇数个尾随反斜杠：shell-quote 必然误判。
+                if backslash_count > 0 && backslash_count % 2 == 1 {
+                    return true;
+                }
+                // 偶数个尾随反斜杠：仅当命令中还存在后续单引号时，
+                // chunker 才会拿它当假闭合引号、合并 token。
+                if backslash_count > 0
+                    && backslash_count % 2 == 0
+                    && command[byte_pos + 1..].contains('\'')
+                {
+                    return true;
+                }
+            }
+        }
+        idx += 1;
+    }
+    false
 }

@@ -256,7 +256,7 @@ pub enum ToolDecisionKind {
 
 /// 交互式 prompt 回调（仅 REPL 上下文可用）。
 pub type PromptCallback =
-    Arc<dyn for<'a> Fn(PromptRequest) -> BoxFuture<'a, PromptResponse> + Send + Sync>;
+    Arc<dyn Fn(PromptRequest) -> BoxFuture<'static, PromptResponse> + Send + Sync>;
 pub type RequestPromptFn = Arc<dyn Fn(String, Option<String>) -> PromptCallback + Send + Sync>;
 
 /// 工具集刷新回调（如 MCP 服务器在查询中途连上后重新取工具）。

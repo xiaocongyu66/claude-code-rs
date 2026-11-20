@@ -20,6 +20,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
@@ -173,7 +176,7 @@ pub async fn exec_file_no_throw_with_cwd(
         Ok(child) => child,
         Err(e) => {
             // execa 抛 ExecaError 时：logError 并返回空输出 + code 1
-            log_error(anyhow::anyhow!(e));
+            log_error(e);
             return ExecFileResult {
                 stdout: String::new(),
                 stderr: String::new(),
@@ -219,7 +222,7 @@ pub async fn exec_file_no_throw_with_cwd(
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             Err(e) => {
-                log_error(anyhow::anyhow!(e));
+                log_error(e);
                 break;
             }
         }
@@ -305,15 +308,6 @@ where
 {
     match &mut handle {
         Some(stream) => {
-            let mut v = Vec::new();
-            let _ = stream.read_to_end(&mut v).await;
-            v
-        }
-        None => Vec::new(),
-    }
-}
-    match handle {
-        Some(mut stream) => {
             let mut v = Vec::new();
             let _ = stream.read_to_end(&mut v).await;
             v

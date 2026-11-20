@@ -52,7 +52,7 @@ pub async fn get_worktree_paths_portable_with_timeout(
         Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).into_owned(),
         _ => {
             // 超时或失败：尽力收掉子进程
-            let _ = child.start_kill().await;
+            let _ = child.start_kill();
             return Vec::new();
         }
     };

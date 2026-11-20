@@ -16,7 +16,7 @@ use crate::constants::system_prompt_sections::{
     system_prompt_section,
 };
 use crate::constants::xml::TICK_TAG;
-use crate::tool::{McpServerConnection, Tool, Tools};
+use crate::tool::{McpServerConnection, Tools};
 use crate::utils::debug::{DebugLogLevel, log_for_debugging};
 use crate::utils::embedded_tools::has_embedded_search_tools;
 use crate::utils::env_utils::is_env_truthy;
@@ -240,7 +240,7 @@ fn get_simple_doing_tasks_section() -> String {
     ];
     // TS `...codeStyleSubitems` 展开为顶层条目（每条 ` - ` 前缀）
     let mut items = items;
-    items.extend(code_style_subitems.into_iter().map(PromptBullet::Item));
+    items.extend(code_style_subitems.into_iter().map(|s| PromptBullet::Item(s.to_string())));
     items.push(PromptBullet::Item("Avoid backwards-compatibility hacks like renaming unused _vars, re-exporting types, adding // removed comments for removed code, etc. If you are certain that something is unused, you can delete it completely.".to_string()));
     // 虚假声明缓解——已从 ant-only 解除门控
     items.push(PromptBullet::Item("Report outcomes faithfully: if tests fail, say so with the relevant output; if you did not run a verification step, say that rather than implying it succeeded. Never claim \"all tests pass\" when output shows failures, never suppress or simplify failing checks (tests, lints, type errors) to manufacture a green result, and never characterize incomplete or broken work as done. Equally, when a check did pass or a task is complete, state it plainly — do not hedge confirmed results with unnecessary disclaimers, downgrade finished work to \"partial,\" or re-verify things you already checked. The goal is an accurate report, not a defensive one.".to_string()));
@@ -289,7 +289,7 @@ fn get_using_your_tools_section(enabled_tools: &HashSet<String>) -> String {
                 ))
             })
             .into_iter()
-            .collect();
+            .collect::<Vec<_>>();
         if items.is_empty() {
             return String::new();
         }
@@ -343,7 +343,7 @@ fn get_using_your_tools_section(enabled_tools: &HashSet<String>) -> String {
                 ))
             })
             .into_iter()
-            .collect(),
+            .collect::<Vec<_>>(),
     ];
     let mut lines = vec!["# Using your tools".to_string()];
     lines.extend(prepend_bullets(&items));
@@ -554,7 +554,7 @@ pub async fn get_system_prompt(
         system_prompt_section("env_info_simple", move || {
             let model = model_for_sections.clone();
             let additional = additional_for_sections.clone();
-            async move { compute_simple_env_info(&model, Some(&additional)).await }
+            async move { Some(compute_simple_env_info(&model, Some(&additional)).await) }
         }),
         system_prompt_section("language", move || {
             let language = language_for_sections.clone();
@@ -630,7 +630,7 @@ pub async fn get_system_prompt(
     }
 
     // --- 动态内容（注册表管理） ---
-    sections.extend(resolved_dynamic_sections.into_iter().map(Some));
+    sections.extend(resolved_dynamic_sections);
 
     sections.into_iter().flatten().collect()
 }

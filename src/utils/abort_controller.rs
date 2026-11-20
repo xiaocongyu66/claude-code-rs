@@ -17,10 +17,12 @@ use std::sync::{Arc, Mutex, Weak};
 /// 取消原因（对齐 TS 的 signal.reason；Rust 端退化为字符串）。
 pub type AbortReason = String;
 
+#[derive(Debug)]
 pub struct CancellationToken {
     inner: Arc<TokenInner>,
 }
 
+#[derive(Debug)]
 struct TokenInner {
     aborted: std::sync::atomic::AtomicBool,
     reason: Mutex<Option<AbortReason>>,
