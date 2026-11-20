@@ -5,13 +5,5 @@
 //! `services/mod.rs` 解除 `pub mod compaction2;` 挂载。
 
 pub mod contracts;
-pub mod guards;
-pub mod methods;
-pub mod orchestrator;
-pub mod reducers;
-pub mod session;
-pub mod speculation;
-pub mod tokens;
-pub mod triggers;
 
 pub use contracts::*;
