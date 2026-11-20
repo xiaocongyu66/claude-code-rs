@@ -38,25 +38,29 @@ pub struct EditContext {
 
 /// 在 `path` 文件中查找 `needle`，返回带 `context_lines` 行上下文的切片。
 ///
-/// ENOENT → None。needle 在 MAX_SCAN_BYTES 内未找到 →
-/// `{ truncated: true, content: "" }`。
+/// ENOENT → Ok(None)。needle 在 MAX_SCAN_BYTES 内未找到 →
+/// `Ok({ truncated: true, content: "" })`。
+/// 其他打开错误原样上抛（对齐 TS 的 `throw e`）。
 pub async fn read_edit_context(
     path: &str,
     needle: &str,
     context_lines: usize,
-) -> Option<EditContext> {
-    let handle = open_for_scan(path).await?;
-    let mut handle = handle;
-    let result = scan_for_context(&mut handle, needle, context_lines).await;
-    result
+) -> std::io::Result<Option<EditContext>> {
+    let mut handle = match open_for_scan(path).await {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // 句柄在函数结束时 drop（对齐 TS finally 里的 close）
+    Ok(scan_for_context(&mut handle, needle, context_lines).await)
 }
 
-/// 以扫描用途打开文件。ENOENT 返回 None；其余错误上抛。
-pub async fn open_for_scan(path: &str) -> Option<File> {
+/// 以扫描用途打开文件。ENOENT → Ok(None)；其余错误上抛。
+pub async fn open_for_scan(path: &str) -> std::io::Result<Option<File>> {
     match File::open(path).await {
-        Ok(file) => Some(file),
-        Err(e) if is_enoent(&e) => None,
-        Err(_) => None,
+        Ok(file) => Ok(Some(file)),
+        Err(e) if is_enoent(&e) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -244,14 +248,15 @@ async fn slice_context(
         }
     }
 
-    // 读出精确的上下文区间；复用 scratch 放得下则复用
+    // 读出精确的上下文区间。偏差：TS 在 len <= scratch.length 时复用
+    // scratch 输出缓冲；Rust 侧 borrow 检查不允许复用借用中的缓冲，
+    // 这里另分配一次（上下文区间通常远小于块大小，开销可忽略）。
     let len = ctx_end - ctx_start;
     let mut out = vec![0u8; len];
     let out_read = match read_at(handle, &mut out, ctx_start as u64).await {
         Ok(n) => n,
         Err(_) => return EditContext { content: String::new(), line_offset, truncated: false },
     };
-    let _ = scratch; // scratch 借用到此为止
     EditContext {
         content: normalize_crlf(&out[..out_read]),
         line_offset,

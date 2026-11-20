@@ -12,3 +12,4 @@ pub mod utils;
 pub mod tool;
 pub mod tools;
 pub mod services;
+pub mod query;

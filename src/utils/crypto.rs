@@ -4,8 +4,6 @@
 //! `randomUUID` 具名重导出（显式 import-then-export 以避免 bun
 //! bytecode 链接问题）；Rust 侧转发到 `uuid` crate 的 v4 生成。
 
-pub use crate::utils::random_uuid_string as random_uuid;
-
 use uuid::Uuid;
 
 /// 生成随机 UUID v4 字符串（对齐 TS `randomUUID()`）。
