@@ -1193,10 +1193,10 @@ impl Iterator for ReverseLines {
             };
             // remainder = 首个换行符之前的部分（仍待回溯）
             self.remainder = combined[..first_newline].to_vec();
-            // 换行符之后的部分按 '\n' 切行，逆序压栈（跳过空行）
+            // 换行符之后的部分按 '\n' 切行，正序压栈（LIFO 弹出即逆序；跳过空行）
             let tail = &combined[first_newline + 1..];
             let text = String::from_utf8_lossy(tail).into_owned();
-            for line in text.split('\n').rev() {
+            for line in text.split('\n') {
                 if !line.is_empty() {
                     self.pending.push(line.to_string());
                 }

@@ -137,13 +137,13 @@ fn describe_string(s: &str) -> String {
 /// 慢操作计时守卫。`Drop` 时计时；超过阈值且未重入时记录 debug 日志
 /// 并登记慢操作。未启用（`FEATURE_SLOW_OPERATION_LOGGING` 关闭）时为
 /// 零开销 no-op。
-pub struct SlowOperationGuard {
+pub struct SlowOperationGuard<'a> {
     start: Option<Instant>,
-    build_description: Option<Box<dyn FnOnce() -> String + Send>>,
+    build_description: Option<Box<dyn FnOnce() -> String + Send + 'a>>,
     backtrace: Option<Backtrace>,
 }
 
-impl Drop for SlowOperationGuard {
+impl Drop for SlowOperationGuard<'_> {
     fn drop(&mut self) {
         let Some(start) = self.start else {
             return;
@@ -192,9 +192,9 @@ impl Drop for SlowOperationGuard {
 /// let _guard = slow_logging(|| "JSON.stringify".to_string());
 /// let _json = serde_json::to_string(&serde_json::json!({"a": 1})).unwrap_or_default();
 /// ```
-pub fn slow_logging<F>(build: F) -> SlowOperationGuard
+pub fn slow_logging<'a, F>(build: F) -> SlowOperationGuard<'a>
 where
-    F: FnOnce() -> String + Send + 'static,
+    F: FnOnce() -> String + Send + 'a,
 {
     let enabled = slow_logging_enabled();
     SlowOperationGuard {
@@ -209,7 +209,7 @@ where
 }
 
 /// 便捷守卫工厂：描述为固定标签（对齐 TS `slowLogging\`label\`` 无插值场景）。
-pub fn slow_logging_named(label: &str) -> SlowOperationGuard {
+pub fn slow_logging_named(label: &str) -> SlowOperationGuard<'static> {
     let label = label.to_string();
     slow_logging(move || label)
 }
