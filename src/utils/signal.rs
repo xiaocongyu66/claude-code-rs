@@ -12,7 +12,8 @@
 //! - `emit` 期间取消订阅：TS 中未遍历到的监听器本轮不再触发；
 //!   本实现本轮完成后才移除，已注册的监听器仍会在当前轮触发。
 
-use std::sync::{Arc, AtomicU64, Mutex};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 type Listener<E> = Box<dyn FnMut(&E) + Send + Sync>;
 

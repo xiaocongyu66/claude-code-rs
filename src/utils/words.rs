@@ -786,7 +786,7 @@ fn random_int(max: u32) -> u32 {
     }
 }
 
-fn pick_random(array: &[&str]) -> &str {
+fn pick_random<'a>(array: &'a [&'a str]) -> &'a str {
     array[random_int(array.len() as u32) as usize]
 }
 

@@ -17,8 +17,6 @@
 //! - zod object 剥离未知键（Rust 侧直接忽略），缺 `toolName` 报错，
 //!   `ruleContent` 缺省时为 `None`。
 
-use crate::types::permissions::{PermissionBehavior, PermissionRuleValue};
-
 // 再出口（对齐 TS 的 `export type { ... } from '../../types/permissions.js'`）
 pub use crate::types::permissions::{
     PermissionBehavior, PermissionRule, PermissionRuleSource, PermissionRuleValue,

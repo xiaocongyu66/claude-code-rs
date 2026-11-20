@@ -32,7 +32,8 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::sync::{Arc, AtomicBool, AtomicI64, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Utc;

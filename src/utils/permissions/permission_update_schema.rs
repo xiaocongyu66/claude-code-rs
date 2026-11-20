@@ -11,14 +11,11 @@
 //! 类型本体（`PermissionUpdate` / `PermissionUpdateDestination`）提取自
 //! `src/types/permissions.ts`（已重写为 `src/types/permissions.rs`）。
 
-use crate::types::permissions::{
-    PermissionUpdate, PermissionUpdateDestination, PermissionRuleValue,
-};
 use crate::utils::permissions::permission_mode::external_permission_mode_schema;
 use crate::utils::permissions::permission_rule::{permission_behavior_schema, permission_rule_value_schema};
 
 // 再出口（对齐 TS 的 `export type { PermissionUpdate, PermissionUpdateDestination }`）
-pub use crate::types::permissions::{PermissionUpdate, PermissionUpdateDestination};
+pub use crate::types::permissions::{PermissionUpdate, PermissionUpdateDestination, PermissionRuleValue};
 
 /// `permissionUpdateDestinationSchema`：解析权限更新的持久化目标。
 ///

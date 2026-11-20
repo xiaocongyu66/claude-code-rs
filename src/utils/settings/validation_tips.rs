@@ -38,7 +38,6 @@ struct StaticTip {
     doc_link: Option<&'static str>,
 }
 
-const DOCUMENTATION_BASE: &str = "https://code.claude.com/docs/en";
 
 /// 模块内部的提示匹配器表（TS `TIP_MATCHERS`），顺序即优先级。
 static TIP_MATCHERS: &[(fn(&TipContext) -> bool, StaticTip)] = &[
@@ -48,7 +47,7 @@ static TIP_MATCHERS: &[(fn(&TipContext) -> bool, StaticTip)] = &[
             suggestion: Some(
                 "Valid modes: \"acceptEdits\" (ask before file changes), \"plan\" (analysis only), \"bypassPermissions\" (auto-accept all), or \"default\" (standard behavior)",
             ),
-            doc_link: Some(concat!(DOCUMENTATION_BASE, "/iam#permission-modes")),
+            doc_link: Some("https://code.claude.com/docs/en/iam#permission-modes"),
         },
     ),
     (
@@ -79,7 +78,7 @@ static TIP_MATCHERS: &[(fn(&TipContext) -> bool, StaticTip)] = &[
             suggestion: Some(
                 "Environment variables must be strings. Wrap numbers and booleans in quotes. Example: \"DEBUG\": \"true\", \"PORT\": \"3000\"",
             ),
-            doc_link: Some(concat!(DOCUMENTATION_BASE, "/settings#environment-variables")),
+            doc_link: Some("https://code.claude.com/docs/en/settings#environment-variables"),
         },
     ),
     (
@@ -124,7 +123,7 @@ static TIP_MATCHERS: &[(fn(&TipContext) -> bool, StaticTip)] = &[
             suggestion: Some(
                 "Check for typos or refer to the documentation for valid fields",
             ),
-            doc_link: Some(concat!(DOCUMENTATION_BASE, "/settings")),
+            doc_link: Some("https://code.claude.com/docs/en/settings"),
         },
     ),
     (
@@ -154,7 +153,7 @@ static TIP_MATCHERS: &[(fn(&TipContext) -> bool, StaticTip)] = &[
             suggestion: Some(
                 "Must be an array of directory paths. Example: [\"~/projects\", \"/tmp/workspace\"]. You can also use --add-dir flag or /add-dir command",
             ),
-            doc_link: Some(concat!(DOCUMENTATION_BASE, "/iam#working-directories")),
+            doc_link: Some("https://code.claude.com/docs/en/iam#working-directories"),
         },
     ),
 ];
@@ -163,13 +162,13 @@ static TIP_MATCHERS: &[(fn(&TipContext) -> bool, StaticTip)] = &[
 static PATH_DOC_LINKS: &[(&str, &str)] = &[
     (
         "permissions",
-        concat!(DOCUMENTATION_BASE, "/iam#configuring-permissions"),
+        "https://code.claude.com/docs/en/iam#configuring-permissions",
     ),
     (
         "env",
-        concat!(DOCUMENTATION_BASE, "/settings#environment-variables"),
+        "https://code.claude.com/docs/en/settings#environment-variables",
     ),
-    ("hooks", concat!(DOCUMENTATION_BASE, "/hooks")),
+    ("hooks", "https://code.claude.com/docs/en/hooks"),
 ];
 
 pub fn get_validation_tip(context: &TipContext) -> Option<ValidationTip> {
