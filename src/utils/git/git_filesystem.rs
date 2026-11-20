@@ -32,7 +32,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -166,7 +166,8 @@ fn find_git_root_impl(start_path: &str) -> Option<String> {
 
 /// resolveGitDir 的缓存：键为 resolve 后的 startPath，值为 Option（对齐
 /// TS 的 `Map<string, string | null>`，None 表示「不在 git 仓库」）。
-static RESOLVE_GIT_DIR_CACHE: Mutex<HashMap<PathBuf, Option<PathBuf>>> = Mutex::new(HashMap::new());
+static RESOLVE_GIT_DIR_CACHE: LazyLock<Mutex<HashMap<PathBuf, Option<PathBuf>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 清除 resolveGitDir 缓存（对齐 TS 的 clearResolveGitDirCache，测试用）。
 pub fn clear_resolve_git_dir_cache() {

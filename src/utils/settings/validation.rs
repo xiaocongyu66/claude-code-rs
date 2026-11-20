@@ -200,8 +200,8 @@ pub fn format_zod_error(issues: &[SchemaIssue], file_path: &str) -> Vec<Validati
                 message,
                 expected,
                 invalid_value,
-                suggestion: tip.and_then(|t| t.suggestion),
-                doc_link: tip.and_then(|t| t.doc_link),
+                suggestion: tip.as_ref().and_then(|t| t.suggestion.clone()),
+                doc_link: tip.as_ref().and_then(|t| t.doc_link.clone()),
                 mcp_error_metadata: None,
             }
         })

@@ -21,8 +21,6 @@
 //!   Rust，该函数将由其对应模块自行提供。
 //! - `homedir()` 用 HOME / USERPROFILE 环境变量近似（无 dirs crate）。
 
-use std::path::PathBuf;
-
 use unicode_normalization::UnicodeNormalization;
 
 use crate::utils::fs_operations::StdFs;

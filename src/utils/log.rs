@@ -293,9 +293,9 @@ fn is_hard_fail_mode() -> bool {
 /// - 内存：`get_in_memory_errors()`
 pub fn log_error<E>(error: E)
 where
-    E: Error + Send + Sync + 'static,
+    E: Into<Box<dyn Error + Send + Sync + 'static>>,
 {
-    log_error_dyn(Box::new(error));
+    log_error_dyn(error.into());
 }
 
 /// trait 对象入口（供 memoize 等内部 fire-and-forget 路径使用）。

@@ -8,7 +8,7 @@
 use std::env;
 
 use crate::utils::env_utils::is_env_truthy;
-use crate::utils::model::provider_classification::{is_third_party_api_provider, ApiProvider};
+use crate::utils::model::provider_classification::ApiProvider;
 use crate::utils::settings::settings::get_initial_settings;
 use crate::utils::settings::types::ModelTypeSetting;
 

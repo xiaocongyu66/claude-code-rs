@@ -569,7 +569,7 @@ pub fn create_read_rule_suggestion(
         destination,
         rules: vec![PermissionRuleValue {
             tool_name: "Read".to_string(),
-            rule_content,
+            rule_content: Some(rule_content),
         }],
         behavior: PermissionBehavior::Allow,
     })

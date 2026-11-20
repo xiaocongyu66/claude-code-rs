@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "darwin")]
+#[cfg(target_os = "macos")]
 use super::constants::{get_macos_plist_paths, PLUTIL_ARGS_PREFIX, PLUTIL_PATH};
 use super::constants::MDM_SUBPROCESS_TIMEOUT_MS;
 #[cfg(target_os = "windows")]
@@ -91,7 +91,7 @@ fn exec_file_with_timeout(cmd: &str, args: &[&str]) -> Option<String> {
 /// On Windows: spawns reg query for HKLM and HKCU in parallel.
 /// On Linux: returns empty (no MDM equivalent).
 pub fn fire_raw_read() -> RawReadResult {
-    #[cfg(target_os = "darwin")]
+    #[cfg(target_os = "macos")]
     {
         let plist_paths = get_macos_plist_paths();
 
@@ -156,7 +156,7 @@ pub fn fire_raw_read() -> RawReadResult {
         }
     }
 
-    #[cfg(not(any(target_os = "darwin", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         RawReadResult {
             plist_stdouts: None,

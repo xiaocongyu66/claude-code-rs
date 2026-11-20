@@ -823,7 +823,7 @@ pub fn parse_user_specified_model(model_input: &str) -> ModelName {
     let model_string = if has_1m_tag {
         strip_1m_suffix(&normalized_model).trim().to_string()
     } else {
-        normalized_model
+        normalized_model.clone()
     };
 
     if is_model_alias(&model_string) {

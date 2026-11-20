@@ -14,7 +14,7 @@
 //! （O(1) 均摊：HashMap 存值与在队列中的位置索引，get/set 移动到队尾）。
 
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 单个文件的读状态。
 #[derive(Debug, Clone)]

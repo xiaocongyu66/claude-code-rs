@@ -55,7 +55,9 @@ pub struct RemoteTriggerAuditInput {
 
 /// 解析审计文件路径（root_dir 缺省取当前 project root）。
 pub fn resolve_remote_trigger_audit_path(root_dir: Option<&str>) -> PathBuf {
-    let root = root_dir.map(PathBuf::from).unwrap_or_else(state::get_project_root);
+    let root = root_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(state::get_project_root()));
     root.join(REMOTE_TRIGGER_AUDIT_REL)
 }
 

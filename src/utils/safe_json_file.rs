@@ -155,7 +155,11 @@ pub fn quarantine_corrupt_file(path: &Path) -> io::Result<PathBuf> {
             .map(|name| {
                 let mtime = fs::metadata(dir.join(name))
                     .and_then(|m| m.modified())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64))
+                    .and_then(|t| {
+                        t.duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                    })
                     .unwrap_or(0);
                 (name.clone(), mtime)
             })
@@ -213,7 +217,11 @@ where
                 };
                 let holder_mtime_ms = meta
                     .modified()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64))
+                    .and_then(|t| {
+                        t.duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                    })
                     .unwrap_or(0);
                 if now_ms() > holder_mtime_ms + stale_ms {
                     // 僵死资格 —— 但年龄本身不证明被遗弃：仅当记录的

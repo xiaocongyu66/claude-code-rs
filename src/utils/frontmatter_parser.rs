@@ -100,18 +100,11 @@ fn quote_problematic_values(frontmatter_text: &str) -> String {
         .join("\n")
 }
 
-fn yaml_value_to_json(value: &serde_yaml::Value) -> serde_json::Value {
-    // serde_yaml::Value 可序列化为 JSON 兼容形式（数字/字符串/布尔/序列/
-    // 映射直接对应；YAML 特有的 tag 在此路径不出现）。
-    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
-}
-
 fn yaml_to_frontmatter_object(
-    yaml_value: &serde_yaml::Value,
+    yaml_value: &serde_json::Value,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let json = yaml_value_to_json(yaml_value);
-    match json {
-        serde_json::Value::Object(map) => Some(map),
+    match yaml_value {
+        serde_json::Value::Object(map) => Some(map.clone()),
         _ => None,
     }
 }
@@ -215,7 +208,7 @@ pub fn split_path_in_frontmatter(input: &FrontmatterValue) -> Vec<String> {
         FrontmatterValue::String(s) => {
             // 按逗号分隔（尊重花括号）
             let parts = split_respecting_braces(s);
-            parts.into_iter().flat_map(expand_braces).collect()
+            parts.into_iter().flat_map(|p| expand_braces(&p)).collect()
         }
     }
 }

@@ -121,6 +121,14 @@ fn get_settings_for_source_lenient_for_editing_only(source: SettingSource) -> Op
     }
 }
 
+/// `serde_json::Map<String, String>` → `HashMap<String, String>`。
+/// serde_json 只为 `Map<String, Value>` 实现 Clone，需逐项转换。
+fn tool_aliases_to_hashmap(map: &Map<String, String>) -> HashMap<String, String> {
+    map.iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// 计算规则工具名在该 toolAliases 映射下的别名集合。
 ///
 /// 对齐 TS `aliasesForRule`：返回所有「alias !== toolName &&
@@ -159,7 +167,11 @@ pub fn settings_json_to_rules(
         return Vec::new();
     };
 
-    let tool_aliases = data.tool_aliases.clone().unwrap_or_default();
+    let tool_aliases = data
+        .tool_aliases
+        .as_ref()
+        .map(tool_aliases_to_hashmap)
+        .unwrap_or_default();
 
     let mut rules: Vec<PermissionRule> = Vec::new();
     for behavior in SUPPORTED_RULE_BEHAVIORS {
@@ -195,7 +207,7 @@ pub fn set_tool_aliases_for_test(map: Option<HashMap<String, String>>) {
 
 /// 单来源的顶层 `toolAliases` 映射（alias → 规范工具名）。
 pub fn get_tool_aliases_for_source(data: Option<&SettingsJson>) -> HashMap<String, String> {
-    data.and_then(|d| d.tool_aliases.clone())
+    data.and_then(|d| d.tool_aliases.as_ref().map(tool_aliases_to_hashmap))
         .unwrap_or_default()
 }
 
@@ -455,7 +467,7 @@ mod tests {
 
     #[test]
     fn tool_aliases_attach_alias_skill_tool_names() {
-        let mut aliases = HashMap::new();
+        let mut aliases = Map::new();
         aliases.insert("SkillTool".to_string(), "Skill".to_string());
         let data = SettingsJson {
             permissions: Some(PermissionsSettings {
@@ -479,7 +491,7 @@ mod tests {
         map.insert("a".to_string(), "b".to_string());
         set_tool_aliases_for_test(Some(map));
         let merged = get_settings_tool_aliases();
-        assert_eq!(merged.get("a").map(String::as_deref), Some("b"));
+        assert_eq!(merged.get("a").map(|s| s.as_str()), Some("b"));
         set_tool_aliases_for_test(None);
         let merged = get_settings_tool_aliases();
         assert!(!merged.contains_key("a"));

@@ -24,6 +24,8 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+
 use once_cell::sync::Lazy;
 
 use crate::utils::debug::{log_for_debugging, DebugLogLevel};
@@ -387,7 +389,7 @@ pub fn set_shell_if_windows() {
 // 路径转换（LRU 记忆化，容量 500）
 // ---------------------------------------------------------------------------
 
-static WINDOWS_TO_POSIX: Lazy<LruMemoized<(String,), String>> = Lazy::new(|| {
+static WINDOWS_TO_POSIX: Lazy<Arc<LruMemoized<(String,), String>>> = Lazy::new(|| {
     memoize_with_lru(
         |(windows_path,): &(String,)| {
             // UNC：\\server\share -> //server/share
@@ -412,7 +414,7 @@ static WINDOWS_TO_POSIX: Lazy<LruMemoized<(String,), String>> = Lazy::new(|| {
     )
 });
 
-static POSIX_TO_WINDOWS: Lazy<LruMemoized<(String,), String>> = Lazy::new(|| {
+static POSIX_TO_WINDOWS: Lazy<Arc<LruMemoized<(String,), String>>> = Lazy::new(|| {
     memoize_with_lru(
         |(posix_path,): &(String,)| {
             // UNC：//server/share -> \\server\share

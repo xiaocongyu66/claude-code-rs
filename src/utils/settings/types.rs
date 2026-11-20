@@ -23,6 +23,8 @@
 //! - sandbox / hooks / marketplace 的 describe 文本不进校验器（JSON Schema
 //!   输出由 schema_output.rs 单独承载）。
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value};
 
 use crate::bootstrap::state::HookEvent;
@@ -311,23 +313,17 @@ pub struct SchemaIssue {
     pub path: Vec<String>,
     pub message: String,
     /// invalid_type 的期望类型 / too_small 的最小值。
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
     /// invalid_type 的实际输入。
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<Value>,
     /// invalid_value 的合法枚举值。
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<Value>>,
     /// unrecognized_keys 的键列表。
     pub keys: Vec<String>,
     /// too_small/too_big 的数值。
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum: Option<f64>,
     /// custom issue 的 params（`{ received: ... }`）。
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Map<String, Value>>,
 }
 
@@ -638,7 +634,7 @@ pub struct SandboxSettings {
     pub filesystem: Option<SandboxFilesystemConfig>,
     /// record<string, array<string>>，保留原始 JSON。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ignore_violations: Option<Map<String, Vec<String>>>,
+    pub ignore_violations: Option<HashMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_weaker_nested_sandbox: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -741,7 +737,7 @@ pub struct HttpHook {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub headers: Option<Map<String, String>>,
+    pub headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_env_vars: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -765,12 +761,11 @@ pub struct HookMatcher {
 }
 
 /// `hooks`（HooksSchema = partialRecord(HOOK_EVENTS, HookMatcher[])）。
-pub type HooksSettings = Map<String, Vec<HookMatcher>>;
+pub type HooksSettings = HashMap<String, Vec<HookMatcher>>;
 
 /// 插件 hook matcher（内部类型，含插件上下文；非 zod schema）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginHookMatcher {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     pub hooks: Vec<HookCommand>,
     pub plugin_root: String,
@@ -782,7 +777,6 @@ pub struct PluginHookMatcher {
 /// skill hook matcher（内部类型；非 zod schema）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillHookMatcher {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     pub hooks: Vec<HookCommand>,
     pub skill_root: String,
@@ -945,9 +939,9 @@ pub enum UserConfigValue {
 #[serde(rename_all = "camelCase")]
 pub struct PluginConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_servers: Option<Map<String, Map<String, UserConfigValue>>>,
+    pub mcp_servers: Option<HashMap<String, HashMap<String, UserConfigValue>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub options: Option<Map<String, UserConfigValue>>,
+    pub options: Option<HashMap<String, UserConfigValue>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -983,7 +977,7 @@ pub struct SettingsJson {
     pub cleanup_period_days: Option<i64>,
     /// z.record(string, coerce.string())：数字/布尔会被转成字符串。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub env: Option<Map<String, String>>,
+    pub env: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attribution: Option<AttributionSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -993,7 +987,7 @@ pub struct SettingsJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<PermissionsSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_aliases: Option<Map<String, String>>,
+    pub tool_aliases: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_type: Option<ModelTypeSetting>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1001,10 +995,10 @@ pub struct SettingsJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_models: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_overrides: Option<Map<String, String>>,
+    pub model_overrides: Option<HashMap<String, String>>,
     /// record<string, 正整数>。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_window_overrides: Option<Map<String, i64>>,
+    pub context_window_overrides: Option<HashMap<String, i64>>,
     /// 整段 catch：非法值整体丢弃。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionSettings>,
@@ -1045,7 +1039,7 @@ pub struct SettingsJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_line_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled_plugins: Option<Map<String, EnabledPluginValue>>,
+    pub enabled_plugins: Option<HashMap<String, EnabledPluginValue>>,
     /// record<string, ExtraKnownMarketplace>。条目以 Value 保留，校验在
     /// parse 时按形状进行（key===source.name 检查等）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1119,7 +1113,7 @@ pub struct SettingsJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub company_announcements: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub plugin_configs: Option<Map<String, PluginConfig>>,
+    pub plugin_configs: Option<HashMap<String, PluginConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1466,9 +1460,9 @@ fn need_record_string(
     v: &Value,
     path: Vec<String>,
     issues: &mut Vec<SchemaIssue>,
-) -> Option<Map<String, String>> {
+) -> Option<HashMap<String, String>> {
     let obj = need_object(v, path.clone(), issues)?;
-    let mut out = Map::new();
+    let mut out = HashMap::new();
     for (k, val) in obj {
         if let Some(s) = need_string(val, child_path(&path, k), issues) {
             out.insert(k.clone(), s);
@@ -1482,9 +1476,9 @@ fn need_record_coerced_string(
     v: &Value,
     path: Vec<String>,
     issues: &mut Vec<SchemaIssue>,
-) -> Option<Map<String, String>> {
+) -> Option<HashMap<String, String>> {
     let obj = need_object(v, path.clone(), issues)?;
-    let mut out = Map::new();
+    let mut out = HashMap::new();
     for (k, val) in obj {
         out.insert(k.clone(), coerce_to_string(val));
     }
@@ -1512,9 +1506,9 @@ fn need_record_positive_int(
     v: &Value,
     path: Vec<String>,
     issues: &mut Vec<SchemaIssue>,
-) -> Option<Map<String, i64>> {
+) -> Option<HashMap<String, i64>> {
     let obj = need_object(v, path.clone(), issues)?;
-    let mut out = Map::new();
+    let mut out = HashMap::new();
     for (k, val) in obj {
         let p = child_path(&path, k);
         if let Some(n) = need_int(val, p.clone(), issues) {
@@ -1958,7 +1952,7 @@ fn parse_sandbox(
                 // record<string, array<string>>
                 let p = child_path(&path, k);
                 if let Some(o) = need_object(val, p.clone(), issues) {
-                    let mut map = Map::new();
+                    let mut map = HashMap::new();
                     for (ik, iv) in o {
                         if let Some(arr) = need_string_array(iv, child_path(&p, ik), issues) {
                             map.insert(ik.clone(), arr);
@@ -2027,13 +2021,13 @@ fn parse_hook_command(
             let command = required_string(&mut *issues, "command")?;
             let timeout = obj
                 .get("timeout")
-                .map(|t| need_positive_float(t, child_path(&path, "timeout"), issues));
+                .and_then(|t| need_positive_float(t, child_path(&path, "timeout"), issues));
             Some(HookCommand::Command(BashCommandHook {
                 command,
                 if_condition: obj.get("if").and_then(Value::as_str).map(str::to_string),
                 shell: obj
                     .get("shell")
-                    .map(|s| need_enum(s, child_path(&path, "shell"), &["bash", "powershell"], issues)),
+                    .and_then(|s| need_enum(s, child_path(&path, "shell"), &["bash", "powershell"], issues)),
                 timeout,
                 status_message: obj.get("statusMessage").and_then(Value::as_str).map(str::to_string),
                 once: obj.get("once").and_then(Value::as_bool),
@@ -2056,7 +2050,7 @@ fn parse_hook_command(
             let prompt = required_string(&mut *issues, "prompt")?;
             let timeout = obj
                 .get("timeout")
-                .map(|t| need_positive_float(t, child_path(&path, "timeout"), issues));
+                .and_then(|t| need_positive_float(t, child_path(&path, "timeout"), issues));
             Some(HookCommand::Prompt(PromptHook {
                 prompt,
                 if_condition: obj.get("if").and_then(Value::as_str).map(str::to_string),
@@ -2071,7 +2065,7 @@ fn parse_hook_command(
             let prompt = required_string(&mut *issues, "prompt")?;
             let timeout = obj
                 .get("timeout")
-                .map(|t| need_positive_float(t, child_path(&path, "timeout"), issues));
+                .and_then(|t| need_positive_float(t, child_path(&path, "timeout"), issues));
             Some(HookCommand::Agent(AgentHook {
                 prompt,
                 if_condition: obj.get("if").and_then(Value::as_str).map(str::to_string),
@@ -2095,8 +2089,8 @@ fn parse_hook_command(
             }
             let timeout = obj
                 .get("timeout")
-                .map(|t| need_positive_float(t, child_path(&path, "timeout"), issues));
-            let headers = obj.get("headers").map(|h| {
+                .and_then(|t| need_positive_float(t, child_path(&path, "timeout"), issues));
+            let headers = obj.get("headers").and_then(|h| {
                 need_record_string(h, child_path(&path, "headers"), issues)
             });
             Some(HookCommand::Http(HttpHook {
@@ -2106,7 +2100,7 @@ fn parse_hook_command(
                 headers,
                 allowed_env_vars: obj
                     .get("allowedEnvVars")
-                    .map(|a| need_string_array(a, child_path(&path, "allowedEnvVars"), issues)),
+                    .and_then(|a| need_string_array(a, child_path(&path, "allowedEnvVars"), issues)),
                 status_message: obj.get("statusMessage").and_then(Value::as_str).map(str::to_string),
                 once: obj.get("once").and_then(Value::as_bool),
                 extra: extra_of(obj, &[
@@ -2160,7 +2154,7 @@ fn parse_hooks(
     issues: &mut Vec<SchemaIssue>,
 ) -> Option<HooksSettings> {
     let obj = need_object(v, path.clone(), issues)?;
-    let mut out: HooksSettings = Map::new();
+    let mut out: HooksSettings = HashMap::new();
     for (k, val) in obj {
         let p = child_path(&path, k);
         // partialRecord 的 key 必须是合法 HookEvent
@@ -2421,7 +2415,7 @@ fn parse_extra_known_marketplaces(
                         k,
                         entry_name.unwrap_or("")
                     ),
-                    entry_name.map(Value::String).as_ref(),
+                    entry_name.map(|s| Value::String(s.to_string())),
                 ));
             }
         }
@@ -2777,7 +2771,7 @@ fn parse_settings_inner(data: &Value, strict: bool) -> Result<SettingsJson, Vec<
             "enabledPlugins" => {
                 let o = need_object(value, path.clone(), &mut issues);
                 if let Some(o) = o {
-                    let mut map = Map::new();
+                    let mut map = HashMap::new();
                     for (k, v) in o {
                         let p = child_path(&path, k);
                         match v {
@@ -2969,7 +2963,7 @@ fn parse_settings_inner(data: &Value, strict: bool) -> Result<SettingsJson, Vec<
             "pluginConfigs" => {
                 let o = need_object(value, path.clone(), &mut issues);
                 if let Some(o) = o {
-                    let mut map = Map::new();
+                    let mut map = HashMap::new();
                     for (k, v) in o {
                         let p = child_path(&path, k);
                         if let Some(pc) = parse_plugin_config(v, p, &mut issues) {
@@ -3265,13 +3259,13 @@ fn parse_plugin_config(
         let Some(mobj) = need_object(m, p.clone(), issues) else {
             return None;
         };
-        let mut out = Map::new();
+        let mut out = HashMap::new();
         for (server, cfg) in mobj {
             let sp = child_path(&p, server);
             let Some(cobj) = need_object(cfg, sp.clone(), issues) else {
                 continue;
             };
-            let mut server_cfg = Map::new();
+            let mut server_cfg = HashMap::new();
             for (k, val) in cobj {
                 let kp = child_path(&sp, k);
                 if let Some(uv) = parse_user_config_value(val, kp, issues) {
@@ -3287,7 +3281,7 @@ fn parse_plugin_config(
         let Some(oobj) = need_object(o, p.clone(), issues) else {
             return None;
         };
-        let mut out = Map::new();
+        let mut out = HashMap::new();
         for (k, val) in oobj {
             let kp = child_path(&p, k);
             if let Some(uv) = parse_user_config_value(val, kp.clone(), issues) {

@@ -659,6 +659,135 @@ impl FsOperations for StdFs {
     }
 }
 
+/// 透明转发实现：让 `Arc<dyn FsOperations + Send + Sync>` 等共享句柄
+/// 可直接作为 `FsOperations` 使用（settings 等模块以 Arc 持有 fs 句柄）。
+impl<T: FsOperations + ?Sized> FsOperations for Arc<T> {
+    fn cwd(&self) -> io::Result<String> {
+        (**self).cwd()
+    }
+
+    fn exists_sync(&self, path: &str) -> bool {
+        (**self).exists_sync(path)
+    }
+
+    fn stat(&self, path: &str) -> io::Result<FileStats> {
+        (**self).stat(path)
+    }
+
+    fn readdir(&self, path: &str) -> io::Result<Vec<DirEntry>> {
+        (**self).readdir(path)
+    }
+
+    fn unlink(&self, path: &str) -> io::Result<()> {
+        (**self).unlink(path)
+    }
+
+    fn rmdir(&self, path: &str) -> io::Result<()> {
+        (**self).rmdir(path)
+    }
+
+    fn rm(&self, path: &str, options: Option<&RmOptions>) -> io::Result<()> {
+        (**self).rm(path, options)
+    }
+
+    fn mkdir(&self, path: &str, options: Option<&MkdirOptions>) -> io::Result<()> {
+        (**self).mkdir(path, options)
+    }
+
+    fn read_file(&self, path: &str, encoding: BufferEncoding) -> io::Result<String> {
+        (**self).read_file(path, encoding)
+    }
+
+    fn rename(&self, old_path: &str, new_path: &str) -> io::Result<()> {
+        (**self).rename(old_path, new_path)
+    }
+
+    fn stat_sync(&self, path: &str) -> io::Result<FileStats> {
+        (**self).stat_sync(path)
+    }
+
+    fn lstat_sync(&self, path: &str) -> io::Result<FileStats> {
+        (**self).lstat_sync(path)
+    }
+
+    fn read_file_sync(&self, path: &str, encoding: BufferEncoding) -> io::Result<String> {
+        (**self).read_file_sync(path, encoding)
+    }
+
+    fn read_file_bytes_sync(&self, path: &str) -> io::Result<Vec<u8>> {
+        (**self).read_file_bytes_sync(path)
+    }
+
+    fn read_sync(&self, path: &str, length: usize) -> io::Result<ReadSyncResult> {
+        (**self).read_sync(path, length)
+    }
+
+    fn append_file_sync(
+        &self,
+        path: &str,
+        data: &str,
+        options: Option<&AppendFileOptions>,
+    ) -> io::Result<()> {
+        (**self).append_file_sync(path, data, options)
+    }
+
+    fn copy_file_sync(&self, src: &str, dest: &str) -> io::Result<()> {
+        (**self).copy_file_sync(src, dest)
+    }
+
+    fn unlink_sync(&self, path: &str) -> io::Result<()> {
+        (**self).unlink_sync(path)
+    }
+
+    fn rename_sync(&self, old_path: &str, new_path: &str) -> io::Result<()> {
+        (**self).rename_sync(old_path, new_path)
+    }
+
+    fn link_sync(&self, target: &str, path: &str) -> io::Result<()> {
+        (**self).link_sync(target, path)
+    }
+
+    fn symlink_sync(&self, target: &str, path: &str, ty: Option<SymlinkType>) -> io::Result<()> {
+        (**self).symlink_sync(target, path, ty)
+    }
+
+    fn readlink_sync(&self, path: &str) -> io::Result<String> {
+        (**self).readlink_sync(path)
+    }
+
+    fn realpath_sync(&self, path: &str) -> io::Result<String> {
+        (**self).realpath_sync(path)
+    }
+
+    fn mkdir_sync(&self, path: &str, options: Option<&MkdirOptions>) -> io::Result<()> {
+        (**self).mkdir_sync(path, options)
+    }
+
+    fn readdir_sync(&self, path: &str) -> io::Result<Vec<DirEntry>> {
+        (**self).readdir_sync(path)
+    }
+
+    fn readdir_string_sync(&self, path: &str) -> io::Result<Vec<String>> {
+        (**self).readdir_string_sync(path)
+    }
+
+    fn rmdir_sync(&self, path: &str) -> io::Result<()> {
+        (**self).rmdir_sync(path)
+    }
+
+    fn rm_sync(&self, path: &str, options: Option<&RmOptions>) -> io::Result<()> {
+        (**self).rm_sync(path, options)
+    }
+
+    fn create_write_stream(&self, path: &str) -> io::Result<File> {
+        (**self).create_write_stream(path)
+    }
+
+    fn read_file_bytes(&self, path: &str, max_bytes: Option<usize>) -> io::Result<Vec<u8>> {
+        (**self).read_file_bytes(path, max_bytes)
+    }
+}
+
 fn readdir_with_types(path: &str) -> io::Result<Vec<DirEntry>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(path)? {

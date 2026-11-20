@@ -304,7 +304,7 @@ async fn query_loop(
         cumulative_usage: empty_usage(),
     };
     // task_budget.remaining 跨压缩边界累计（压缩模块未转换 → 恒为 None）。
-    let mut task_budget_remaining: Option<i64> = None;
+    let task_budget_remaining: Option<i64> = None;
 
     loop {
         sink.emit(QueryEvent::StreamRequestStart);

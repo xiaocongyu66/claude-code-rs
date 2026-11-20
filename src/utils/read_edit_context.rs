@@ -52,7 +52,7 @@ pub async fn read_edit_context(
         Err(e) => return Err(e),
     };
     // 句柄在函数结束时 drop（对齐 TS finally 里的 close）
-    Ok(scan_for_context(&mut handle, needle, context_lines).await)
+    Ok(Some(scan_for_context(&mut handle, needle, context_lines).await))
 }
 
 /// 以扫描用途打开文件。ENOENT → Ok(None)；其余错误上抛。
@@ -242,7 +242,7 @@ async fn slice_context(
         ctx_end += 1;
         if scratch[i] == NL {
             nl_seen += 1;
-            if nl_seen >= context_lines + 1 {
+            if nl_seen > context_lines {
                 break;
             }
         }

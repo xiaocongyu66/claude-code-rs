@@ -68,12 +68,17 @@ pub struct CommandOption {
 }
 
 /// 选项名：单个或多个别名。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OptionName {
-    #[default]
     Single(String),
     Many(Vec<String>),
+}
+
+impl Default for OptionName {
+    fn default() -> Self {
+        OptionName::Single(String::new())
+    }
 }
 
 impl CommandSpec {

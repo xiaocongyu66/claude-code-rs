@@ -22,7 +22,7 @@
 //! - `addFileGlobRuleToGitignore`（utils/git/gitignore.ts）以内联的最小
 //!   实现近似（`.git` 存在检查 + 全局 ignore 文件追加）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -40,7 +40,7 @@ use crate::utils::env_utils::{get_claude_config_home_dir, is_env_truthy};
 use crate::utils::errors::{get_errno_code, is_enoent};
 use crate::utils::fs_operations::{get_fs_implementation, safe_resolve_path, BufferEncoding};
 use crate::utils::json_read::strip_bom;
-use crate::utils::log::log_error;
+use crate::utils::log::{StringError, log_error};
 use crate::utils::platform::get_platform;
 use crate::utils::settings::constants::get_enabled_setting_sources;
 use crate::utils::settings::internal_writes::mark_internal_write;
@@ -159,7 +159,10 @@ pub fn load_managed_file_settings() -> (Option<SettingsJson>, Vec<ValidationErro
     let mut merged: Value = Value::Object(Map::new());
     let mut found = false;
 
-    let (base, base_errors) = parse_settings_file(&get_managed_settings_file_path());
+    let ParsedSettings {
+        settings: base,
+        errors: base_errors,
+    } = parse_settings_file(&get_managed_settings_file_path());
     errors.extend(base_errors);
     if let Some(s) = base {
         if !settings_is_empty(&s) {
@@ -186,7 +189,10 @@ pub fn load_managed_file_settings() -> (Option<SettingsJson>, Vec<ValidationErro
         names.sort();
         for name in names {
             let path = Path::new(drop_in_dir).join(&name);
-            let (settings, file_errors) = parse_settings_file(&path.to_string_lossy());
+            let ParsedSettings {
+                settings,
+                errors: file_errors,
+            } = parse_settings_file(&path.to_string_lossy());
             errors.extend(file_errors);
             if let Some(s) = settings {
                 if !settings_is_empty(&s) {
@@ -216,7 +222,8 @@ pub fn load_managed_file_settings() -> (Option<SettingsJson>, Vec<ValidationErro
 
 /// 哪些文件托管 settings 来源存在（/status 显示用）。
 pub fn get_managed_file_settings_presence() -> (bool, bool) {
-    let (base, _) = parse_settings_file(&get_managed_settings_file_path());
+    let ParsedSettings { settings: base, .. } =
+        parse_settings_file(&get_managed_settings_file_path());
     let has_base = base.map(|s| !settings_is_empty(&s)).unwrap_or(false);
 
     let mut has_drop_ins = false;
@@ -259,7 +266,7 @@ fn handle_file_system_error(error: &dyn std::error::Error, path: &str) {
             DebugLogLevel::Debug,
         );
     } else {
-        log_error(format!("{error}"));
+        log_error(StringError::new(format!("{error}")));
     }
 }
 
@@ -268,9 +275,9 @@ fn handle_file_system_error(error: &dyn std::error::Error, path: &str) {
 pub fn parse_settings_file(path: &str) -> ParsedSettings {
     if let Some(cached) = get_cached_parsed_file(path) {
         return ParsedSettings {
-            settings: cached.settings.map(|s| clone_deep(&settings_to_value(&s))
-                .and_then(|v| parse_settings_json(&v).ok())
-                .unwrap_or_default()),
+            settings: cached.settings.map(|s| {
+                parse_settings_json(&clone_deep(&settings_to_value(&s))).unwrap_or_default()
+            }),
             errors: cached.errors,
         };
     }
@@ -278,18 +285,16 @@ pub fn parse_settings_file(path: &str) -> ParsedSettings {
     set_cached_parsed_file(path, result.clone());
     // 首次返回也深拷贝——调用方可能在下一次缓存读取前改动结果
     ParsedSettings {
-        settings: result
-            .settings
-            .map(|s| clone_deep(&settings_to_value(&s))
-                .and_then(|v| parse_settings_json(&v).ok())
-                .unwrap_or_default()),
+        settings: result.settings.map(|s| {
+            parse_settings_json(&clone_deep(&settings_to_value(&s))).unwrap_or_default()
+        }),
         errors: result.errors,
     }
 }
 
 fn parse_settings_file_uncached(path: &str) -> ParsedSettings {
     let fs = get_fs_implementation();
-    let resolved = safe_resolve_path(&fs, path);
+    let resolved = safe_resolve_path(&*fs, path);
     let content: String = match fs.read_file_sync(&resolved.resolved_path, BufferEncoding::Utf8) {
         Ok(c) => c,
         Err(e) => {
@@ -568,7 +573,9 @@ pub fn update_settings_for_source(source: SettingSource, settings: &Value) -> Re
     })();
 
     if let Err(e) = &result {
-        log_error(format!("Failed to update settings for {file_path}: {e}"));
+        log_error(StringError::new(format!(
+            "Failed to update settings for {file_path}: {e}"
+        )));
     }
     result
 }
@@ -909,7 +916,8 @@ fn load_settings_from_disk() -> SettingsWithErrors {
                     .to_string_lossy()
                     .to_string();
                 if seen_files.insert(resolved.clone()) {
-                    let (settings, errors) = parse_settings_file(file_path.as_str());
+                    let ParsedSettings { settings, errors } =
+                        parse_settings_file(file_path.as_str());
                     for error in errors {
                         let error_key = format!(
                             "{}:{}:{}",
@@ -1092,7 +1100,7 @@ pub fn raw_settings_contains_key(key: &str) -> bool {
             continue;
         };
         let fs = get_fs_implementation();
-        let resolved = safe_resolve_path(&fs, &file_path);
+        let resolved = safe_resolve_path(&*fs, &file_path);
         let content: String = match fs.read_file_sync(&resolved.resolved_path, BufferEncoding::Utf8) {
             Ok(c) => c,
             Err(e) => {
@@ -1177,7 +1185,7 @@ mod tests {
     fn keys_for_logging_expand_nested() {
         let mut settings = SettingsJson::default();
         settings.model = Some("claude-4".to_string());
-        let value = json!({"allow": ["Bash(x)"], "unknown": 1});
+        let _value = json!({"allow": ["Bash(x)"], "unknown": 1});
         settings.permissions = Some(crate::utils::settings::types::PermissionsSettings {
             allow: Some(vec!["Bash(x)".to_string()]),
             deny: None,

@@ -129,7 +129,7 @@ pub fn get_enabled_setting_sources() -> Vec<SettingSource> {
     let allowed = get_allowed_setting_sources();
     let mut result = Vec::with_capacity(allowed.len() + 2);
     let mut seen = Vec::with_capacity(allowed.len() + 2);
-    for source in allowed.iter().chain([
+    for source in allowed.iter().chain(&[
         // Always include policy and flag settings
         SettingSource::PolicySettings,
         SettingSource::FlagSettings,

@@ -48,8 +48,19 @@ pub async fn get_worktree_paths_portable_with_timeout(
         Ok(child) => child,
         Err(_) => return Vec::new(),
     };
-    let stdout = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).into_owned(),
+    // 先取走 stdout 管道，这样超时后仍可通过 child 句柄 kill 子进程。
+    let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
+    let mut buf = Vec::new();
+    let stdout = match tokio::time::timeout(
+        timeout,
+        tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut buf),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            let _ = child.wait().await;
+            String::from_utf8_lossy(&buf).into_owned()
+        }
         _ => {
             // 超时或失败：尽力收掉子进程
             let _ = child.start_kill();

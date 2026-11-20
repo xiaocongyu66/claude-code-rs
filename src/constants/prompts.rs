@@ -331,20 +331,17 @@ fn get_using_your_tools_section(enabled_tools: &HashSet<String>) -> String {
         )
     };
 
-    let items: Vec<PromptBullet> = vec![
+    let mut items: Vec<PromptBullet> = vec![
         PromptBullet::Item(core_tools_list),
         PromptBullet::Item(format!(
             "Search before saying unknown — when the user references a file, function, or module you have not seen, search with {GREP_TOOL_NAME}/{GLOB_TOOL_NAME} first."
         )),
-        task_tool_name
-            .map(|name| {
-                PromptBullet::Item(format!(
-                    "Break down and manage your work with the {name} tool. Mark each task as completed as soon as you are done."
-                ))
-            })
-            .into_iter()
-            .collect::<Vec<_>>(),
     ];
+    if let Some(name) = task_tool_name {
+        items.push(PromptBullet::Item(format!(
+            "Break down and manage your work with the {name} tool. Mark each task as completed as soon as you are done."
+        )));
+    }
     let mut lines = vec!["# Using your tools".to_string()];
     lines.extend(prepend_bullets(&items));
     lines.join("\n")
@@ -537,7 +534,10 @@ pub async fn get_system_prompt(
     let enabled_tools_for_sections = enabled_tools.clone();
     let skill_commands_for_sections = skill_tool_commands.clone();
     let language_for_sections = language.clone();
-    let mcp_clients_for_sections = mcp_clients;
+    // 闭包需要满足 'static（段落注册器跨 await 持有），把借用的切片
+    // 转成 owned 副本后再 move 进闭包。
+    let mcp_clients_for_sections: Option<Vec<McpServerConnection>> =
+        mcp_clients.map(|clients| clients.to_vec());
     let output_style_config_for_sections = output_style_config.clone();
 
     let mut dynamic_sections: Vec<SystemPromptSection> = vec![
@@ -570,11 +570,14 @@ pub async fn get_system_prompt(
         // 选择），使会话中途门控翻转不会读到过期缓存值。
         dangerous_uncached_system_prompt_section(
             "mcp_instructions",
-            || async move {
-                if is_mcp_instructions_delta_enabled() {
-                    None
-                } else {
-                    get_mcp_instructions_section(mcp_clients_for_sections)
+            move || {
+                let mcp_clients = mcp_clients_for_sections.clone();
+                async move {
+                    if is_mcp_instructions_delta_enabled() {
+                        None
+                    } else {
+                        get_mcp_instructions_section(mcp_clients.as_deref())
+                    }
                 }
             },
             "MCP servers connect/disconnect between turns",

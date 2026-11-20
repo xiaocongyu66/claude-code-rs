@@ -137,7 +137,7 @@ fn contains_heredoc(command: &str) -> bool {
             }
             // 定界符三种形式：引号包裹 / 反斜杠前缀 / 裸词。
             if q < len && chars[q] == '\\' {
-                let mut w = q + 1;
+                let w = q + 1;
                 if w < len && is_word_char(chars[w]) {
                     return true;
                 }
