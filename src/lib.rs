@@ -14,3 +14,4 @@ pub mod tools;
 pub mod services;
 pub mod query;
 pub mod hooks;
+pub mod query_engine;

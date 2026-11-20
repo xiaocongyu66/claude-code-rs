@@ -392,11 +392,11 @@ impl QueryEngine {
         // custom prompt 优先；defaultSystemPrompt / userContext / systemContext
         // 待 utils/queryContext.ts + context.ts 转换后接入（占位清单 #4）。
         let default_system_prompt: Vec<String> = Vec::new();
-        let mut user_context: HashMap<String, String> = HashMap::new();
-        let system_context: HashMap<String, String> = HashMap::new();
         // COORDINATOR_MODE feature 与 coordinator 模块均未转换 → 不合并额外上下文。
         // 自定义 prompt + CLAUDE_COWORK_MEMORY_PATH_OVERRIDE 的 memory mechanics
         // 提示注入（memdir 未转换）→ 跳过（占位清单 #4）。
+        let user_context: HashMap<String, String> = HashMap::new();
+        let system_context: HashMap<String, String> = HashMap::new();
         let system_prompt: SystemPrompt = {
             let mut parts: Vec<String> = match &custom_system_prompt {
                 Some(custom) => vec![custom.clone()],
@@ -407,7 +407,6 @@ impl QueryEngine {
             }
             parts
         };
-        let _ = &mut user_context; // 后续 coordinator/memory 扩展点
 
         // ---- 结构化输出 enforcement（hooks/registerStructuredOutputEnforcement
         // 未转换）→ 跳过（占位清单 #5）----
