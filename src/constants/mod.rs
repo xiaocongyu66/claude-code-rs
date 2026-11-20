@@ -20,3 +20,6 @@ pub mod query_source;
 pub mod tool_limits;
 pub mod turn_completion_verbs;
 pub mod xml;
+pub mod keys;
+pub mod oauth;
+pub mod system_prompt_sections;
