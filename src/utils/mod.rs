@@ -38,7 +38,6 @@ pub mod local_validate;
 pub mod mailbox;
 pub mod managed_env_constants;
 pub mod modifiers;
-pub mod mod;
 pub mod object_group_by;
 pub mod peer_address;
 pub mod pipe_mute_state;
