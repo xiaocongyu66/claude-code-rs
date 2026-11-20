@@ -145,9 +145,10 @@ pub fn register_hook_event_handler(handler: Option<HookEventHandler>) {
     let drained: Vec<HookExecutionEvent> = {
         let mut handler_guard = lock(&EVENT_HANDLER);
         handler_guard.replace(handler.clone());
-        match handler {
-            Some(_) => std::mem::take(&mut *lock(&PENDING_EVENTS)),
-            None => Vec::new(),
+        if handler.is_some() {
+            std::mem::take(&mut *lock(&PENDING_EVENTS))
+        } else {
+            Vec::new()
         }
     };
     // 在锁外回放，避免处理器回调重入本模块造成死锁。

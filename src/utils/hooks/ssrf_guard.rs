@@ -25,8 +25,9 @@
 //!   （fe80::/10 用精确掩码 `segs[0] >> 6 == 0x3FA`，即首 hextet
 //!   fe80..febf，与 TS 的字符串区间比较同义）。
 //! - `ssrf_guarded_lookup`：IP 字面量直连校验不走 DNS；主机名经
-//!   `tokio::net::lookup_host` 解析后逐个校验（与 TS
-//!   `dnsLookup(hostname, {all:true})` 对应），任一命中拦截段即拒绝。
+//!   `std::net::ToSocketAddrs`（spawn_blocking 线程内，对应 TS
+//!   `dnsLookup(hostname, {all:true})`）解析后逐个校验，任一命中拦截段
+//!   即拒绝。
 //!   TS 的回调风格（axios `lookup` 选项）改为 `Result`；`want_all`
 //!   对齐 TS 的 `options.all`。DNS 解析失败透传为 `SsrfLookupError::Dns`，
 //!   空解析结果为 `ENOTFOUND`。
@@ -233,8 +234,9 @@ fn family_of(ip: &IpAddr) -> u8 {
 /// - `want_all` 为 true 时返回全部（address, family)；否则返回首个。
 /// - 解析结果逐个校验，任一命中拦截段即返回 `SsrfLookupError::Blocked`。
 ///
-/// `tokio::net::lookup_host((hostname, 0))` 对应 TS
-/// `dnsLookup(hostname, {all: true})`；须处于 tokio 运行时上下文。
+/// 阻塞式 `std::net::ToSocketAddrs`（对应 TS `dnsLookup(hostname,
+/// {all: true})`）在 `spawn_blocking` 线程执行，避免阻塞异步运行时；
+/// 调用方须处于 tokio 运行时上下文。
 pub async fn ssrf_guarded_lookup(
     hostname: &str,
     want_all: bool,
@@ -254,9 +256,16 @@ pub async fn ssrf_guarded_lookup(
         });
     }
 
-    let socket_addrs: Vec<SocketAddr> = tokio::net::lookup_host((hostname, 0u16))
-        .await
-        .map_err(|e| SsrfLookupError::Dns(e.to_string()))?;
+    let hostname_owned = hostname.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        (hostname_owned.as_str(), 0u16).to_socket_addrs()
+    })
+    .await;
+    let socket_addrs: Vec<SocketAddr> = match join {
+        Ok(res) => res.map_err(|e| SsrfLookupError::Dns(e.to_string()))?.collect(),
+        Err(join_error) => return Err(SsrfLookupError::Dns(join_error.to_string())),
+    };
 
     for socket_addr in &socket_addrs {
         let ip = socket_addr.ip();

@@ -74,6 +74,9 @@ pub struct MainThreadHook {
     /// 来源；plugin hook 服从 plugin-forwarding 门控。
     pub origin: Option<MainThreadHookOrigin>,
     pub callback: MainThreadHookHandler,
+    /// 注册序号（内部）：HashMap 不保序，用它在 get/dispatch 时还原
+    /// TS Map 的注册顺序。
+    seq: u64,
 }
 
 /// 注册参数（对齐 TS `registerMainThreadHook` 的入参，id 可选）。
@@ -139,14 +142,16 @@ fn next_hook_id(state: &mut RegistryState) -> String {
 /// 注册主线程 hook。支持同 id 的 replace 式重注册（upsert 由
 /// `replace_main_thread_hook` 完成）。返回 id。
 pub fn register_main_thread_hook(hook: RegisterMainThreadHook) -> String {
-    let id = hook.id.clone().unwrap_or_else(|| {
-        let mut state = lock(&REGISTRY);
-        next_hook_id(&mut state)
-    });
+    let mut state = lock(&REGISTRY);
+    let id = hook.id.clone().unwrap_or_else(|| next_hook_id(&mut state));
+    let seq = {
+        state.next_ordinal += 1;
+        state.next_ordinal
+    };
     let events_joined = hook.events.join(", ");
     let hook_id = id.clone();
     let hook_name = hook.name.clone();
-    lock(&REGISTRY).hooks.insert(
+    state.hooks.insert(
         id.clone(),
         MainThreadHook {
             id,
@@ -154,8 +159,10 @@ pub fn register_main_thread_hook(hook: RegisterMainThreadHook) -> String {
             events: hook.events,
             origin: hook.origin,
             callback: hook.callback,
+            seq,
         },
     );
+    drop(state);
     log_for_debugging(
         &format!(
             "[hookRegistry] Registered {} ({}) for events: {}",
@@ -180,6 +187,8 @@ pub fn replace_main_thread_hook(id: &str, next: ReplaceMainThreadHook) -> bool {
             events: next.events.unwrap_or(existing.events),
             origin: next.origin.unwrap_or(existing.origin),
             callback: next.callback.unwrap_or(existing.callback),
+            // 保持原注册顺序（TS `{...existing, ...next}` 语义）
+            seq: existing.seq,
         },
     );
     true
@@ -214,15 +223,17 @@ pub fn clear_main_thread_hooks(event: Option<&str>) -> usize {
     }
 }
 
-/// 快照 listening 指定事件的 hook（按注册顺序）。
+/// 快照 listening 指定事件的 hook（按注册顺序——TS Map 的迭代顺序）。
 pub fn get_main_thread_hooks(event: &str) -> Vec<MainThreadHook> {
     let state = lock(&REGISTRY);
-    state
+    let mut hooks: Vec<MainThreadHook> = state
         .hooks
         .values()
         .filter(|hook| hook.events.iter().any(|e| e == event))
         .cloned()
-        .collect()
+        .collect();
+    hooks.sort_by_key(|hook| hook.seq);
+    hooks
 }
 
 pub fn has_main_thread_hooks(event: &str) -> bool {

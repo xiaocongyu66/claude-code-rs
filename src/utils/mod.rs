@@ -127,3 +127,4 @@ pub mod which;
 pub mod windows_paths;
 pub mod workload_context;
 pub mod messages;
+pub mod hooks;
