@@ -23,3 +23,4 @@ pub mod xml;
 pub mod keys;
 pub mod oauth;
 pub mod system_prompt_sections;
+pub mod prompts;
