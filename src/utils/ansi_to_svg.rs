@@ -387,10 +387,11 @@ pub fn ansi_to_svg(ansi_text: &str, options: &AnsiToSvgOptions) -> String {
     let line_height = options.line_height.unwrap_or(22.0);
     let padding_x = options.padding_x.unwrap_or(24.0);
     let padding_y = options.padding_y.unwrap_or(24.0);
-    let background_color = options.background_color.as_deref().unwrap_or(&format!(
+    let default_bg = format!(
         "rgb({}, {}, {})",
         DEFAULT_BG.r, DEFAULT_BG.g, DEFAULT_BG.b
-    ));
+    );
+    let background_color = options.background_color.as_deref().unwrap_or(&default_bg);
     let border_radius = options.border_radius.unwrap_or(8.0);
 
     let mut lines = parse_ansi(ansi_text);

@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn continuation_message_format() {
-        let msg = get_budget_continuation_message(50, 1200, 50000);
+        let msg = get_budget_continuation_message(50.0, 1200.0, 50000.0);
         assert_eq!(
             msg,
             "Stopped at 50% of token target (1,200 / 50,000). Keep working — do not summarize."

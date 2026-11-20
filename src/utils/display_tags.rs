@@ -15,22 +15,43 @@
 use std::borrow::Cow;
 
 /// 剥离 XML 类标签块；结果 trim 后若为空则返回原文（"有总比没有强"）。
-pub fn strip_display_tags(text: &str) -> &str {
-    let stripped = strip_tags(text, None);
-    let trimmed = stripped.trim();
-    if trimmed.is_empty() { text } else { trimmed }
+pub fn strip_display_tags(text: &str) -> Cow<'_, str> {
+    match strip_tags(text, None) {
+        Cow::Borrowed(stripped) => {
+            let trimmed = stripped.trim();
+            if trimmed.is_empty() {
+                Cow::Borrowed(text)
+            } else {
+                Cow::Borrowed(trimmed)
+            }
+        }
+        Cow::Owned(stripped) => {
+            let trimmed = stripped.trim();
+            if trimmed.is_empty() {
+                Cow::Borrowed(text)
+            } else {
+                Cow::Owned(trimmed.to_string())
+            }
+        }
+    }
 }
 
 /// 同 strip_display_tags，但全部内容都是标签时返回空串。
 /// 用于 getLogDisplayTitle 检测纯命令 prompt（如 /clear）等的回退逻辑。
-pub fn strip_display_tags_allow_empty(text: &str) -> &str {
-    strip_tags(text, None).trim()
+pub fn strip_display_tags_allow_empty(text: &str) -> Cow<'_, str> {
+    match strip_tags(text, None) {
+        Cow::Borrowed(stripped) => Cow::Borrowed(stripped.trim()),
+        Cow::Owned(stripped) => Cow::Owned(stripped.trim().to_string()),
+    }
 }
 
 /// 只剥离 IDE 注入的上下文标签（ide_opened_file / ide_selection）。
 /// 用于 UP 箭头重发时保留用户输入（含 `<code>foo</code>` 这类小写 HTML）。
-pub fn strip_ide_context_tags(text: &str) -> &str {
-    strip_tags(text, Some(&["ide_opened_file", "ide_selection"])).trim()
+pub fn strip_ide_context_tags(text: &str) -> Cow<'_, str> {
+    match strip_tags(text, Some(&["ide_opened_file", "ide_selection"])) {
+        Cow::Borrowed(stripped) => Cow::Borrowed(stripped.trim()),
+        Cow::Owned(stripped) => Cow::Owned(stripped.trim().to_string()),
+    }
 }
 
 /// 扫描器实现 TS 的全局 replace 语义（Cow：无匹配时零拷贝）。

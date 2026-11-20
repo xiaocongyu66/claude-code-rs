@@ -51,7 +51,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new()));
         {
             let events = Arc::clone(&events);
-            set_command_lifecycle_listener(Some(move |uuid, state| {
+            set_command_lifecycle_listener(Some(move |uuid: &str, state: CommandLifecycleState| {
                 events.lock().unwrap().push((uuid.to_string(), state));
             }));
         }

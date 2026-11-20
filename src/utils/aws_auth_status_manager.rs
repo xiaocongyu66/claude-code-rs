@@ -40,6 +40,7 @@ impl AwsAuthStatusManager {
                 status: Mutex::new(AwsAuthStatus {
                     is_authenticating: false,
                     output: Vec::new(),
+                    error: None,
                 }),
                 changed: Signal::new(),
             })

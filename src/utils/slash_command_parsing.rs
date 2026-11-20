@@ -46,7 +46,7 @@ pub fn parse_slash_command(input: &str) -> Option<ParsedSlashCommand> {
         1
     };
 
-    let args = words[args_start_index..].join(' ');
+    let args = words[args_start_index..].join(" ");
 
     Some(ParsedSlashCommand {
         command_name,

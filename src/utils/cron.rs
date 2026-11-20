@@ -188,7 +188,7 @@ pub fn compute_next_cron_run(
 
         if !day_matches {
             // 跳到次日 00:00
-            t = (t.date_naive() + Duration::days(1)).and_time(midnight());
+            t = (t.date() + Duration::days(1)).and_time(midnight());
             continue;
         }
 

@@ -31,7 +31,7 @@ pub fn matches_negative_keyword(input: &str) -> bool {
             "wtf" | "wth" | "ffs" | "omfg" | "dumbass" | "horrible" | "awful" | "shit"
             | "shitty" | "shittiest" => return true,
             "piss" | "pissed" | "pissing" => {
-                if next_word(&text, first_end) == Some("off") {
+                if next_word(&text, first_end).as_deref() == Some("off") {
                     return true;
                 }
             }
@@ -86,17 +86,17 @@ pub fn matches_negative_keyword(input: &str) -> bool {
                 }
             }
             "so" => {
-                if next_word(&text, first_end) == Some("frustrating") {
+                if next_word(&text, first_end).as_deref() == Some("frustrating") {
                     return true;
                 }
             }
             "this" => {
-                if next_word(&text, first_end) == Some("sucks") {
+                if next_word(&text, first_end).as_deref() == Some("sucks") {
                     return true;
                 }
             }
             "damn" => {
-                if next_word(&text, first_end) == Some("it") {
+                if next_word(&text, first_end).as_deref() == Some("it") {
                     return true;
                 }
             }

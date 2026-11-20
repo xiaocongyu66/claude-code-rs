@@ -53,17 +53,15 @@ pub fn parse_debug_filter(filter_string: Option<&str>) -> Option<DebugFilter> {
         .map(|f| f.trim_start_matches('!').to_ascii_lowercase())
         .collect();
 
+    let (include, exclude) = if has_exclusive {
+        (Vec::new(), clean_filters)
+    } else {
+        (clean_filters, Vec::new())
+    };
+
     Some(DebugFilter {
-        include: if has_exclusive {
-            Vec::new()
-        } else {
-            clean_filters
-        },
-        exclude: if has_exclusive {
-            clean_filters
-        } else {
-            Vec::new()
-        },
+        include,
+        exclude,
         is_exclusive: has_exclusive,
     })
 }

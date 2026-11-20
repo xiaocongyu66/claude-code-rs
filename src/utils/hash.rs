@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn long_input_across_block_boundaries() {
         assert_eq!(
-            sha256_hex(&"a".repeat(1_000_000)),
+            sha256_hex("a".repeat(1_000_000).as_bytes()),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
     }

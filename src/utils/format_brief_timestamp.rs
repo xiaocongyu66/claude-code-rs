@@ -32,10 +32,10 @@ pub fn format_brief_timestamp_at<Tz: TimeZone>(
     let twelve_hour = use_twelve_hour();
     let now_date = now.date_naive();
     let days_ago = now_date
-        .signed_duration_since(datetime.date_naive())
+        .signed_duration_since(datetime.date())
         .num_days();
 
-    if days_goes_to_zero(now_date, datetime.date_naive()) {
+    if days_goes_to_zero(now_date, datetime.date()) {
         return format_time(&datetime, twelve_hour, false);
     }
 

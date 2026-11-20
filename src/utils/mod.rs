@@ -75,3 +75,4 @@ pub mod permissions;
 pub mod settings;
 pub mod shell;
 pub mod cache_paths;
+pub mod errors;

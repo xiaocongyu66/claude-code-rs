@@ -2199,7 +2199,7 @@ mod tests {
         assert_eq!(matchers.len(), 1);
         assert!(!matchers[0].is_plugin_hook());
         reset_sdk_init_state();
-        assert!(get_registered_hashes().is_none());
+        assert!(get_registered_hashes().is_empty());
     }
 
     fn get_registered_hashes() -> HashMap<HookEvent, Vec<Arc<dyn RegisteredHookMatcher>>> {

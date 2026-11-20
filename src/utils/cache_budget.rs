@@ -50,12 +50,11 @@ impl<K: Eq + Hash + Clone, V> ByteBudgetCache<K, V> {
 
     /// 查询并刷新最近性。
     pub fn get(&mut self, key: &K) -> Option<&V> {
-        if let Some((value, seq)) = self.map.get(key) {
-            self.touch(key, *seq);
-            Some(value)
-        } else {
-            None
+        let seq = self.map.get(key).map(|(_, seq)| *seq);
+        if let Some(seq) = seq {
+            self.touch(key, seq);
         }
+        self.map.get(key).map(|(value, _)| value)
     }
 
     fn touch(&mut self, key: &K, _seq: u64) {
