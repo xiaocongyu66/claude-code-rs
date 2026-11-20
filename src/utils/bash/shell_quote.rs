@@ -3,16 +3,17 @@
 //! 重写自 `src/utils/bash/shellQuote.ts`。npm 包 `shell-quote` 无 Rust 等价物，
 //! 其 `quote` / `parse` 按 1.12.0 源码语义手写：
 //!
-//! - `quote`：四级分支（`'`+`!` → 单引号转义；`"`/空白/`\` 且无 `'` → 原样单引号；
-//!   `"`/`'`/空白 → 双引号转义 `"\\$``；其余 → 逐字符反斜杠转义，含 Windows
-//!   盘符前缀豁免），对象 token（glob/op/comment）按 quote.js 处理。
+//! - `quote`：四级分支（同时含 `'` 与 `!` → 单引号转义；含 `"`/空白/`\` 且无 `'`
+//!   → 原样单引号；含 `"`/`'`/空白 → 双引号转义 `"\\$``；其余 → 逐字符反斜杠
+//!   转义，含 Windows 盘符前缀 `C:` 豁免），对象 token（glob/op/comment）按
+//!   quote.js 处理。
 //! - `parse`：chunker 正则（CONTROL | (ANSI_C|BAREWORD|DOUBLE_QUOTE|SINGLE_QUOTE)+）
-//!   用手工扫描实现，逐字符状态机做引号/转义/`$` 展开/注释处理，ANSI-C `$'...'`
+//!   用手工扫描实现；逐字符状态机做引号/转义/`$` 展开/注释处理；ANSI-C `$'...'`
 //!   展开与 env 函数的 TOKEN JSON 往返逐条对齐。
 //!
 //! 已知差异（均不影响 claude-code 现有调用方）：
 //! - TS 的 ParseEntry 是联合类型；Rust 用枚举。env 函数返回对象经 TOKEN 往返
-//!   后仅重建 op / glob / comment 三种已知形状，未知 JSON 形状被丢弃
+//!   后仅重建 op / glob / comment 三种已知形状，未知 JSON 形状报错
 //!   （claude-code 唯一的函数 env 用法只返回字符串，该路径不被触发）。
 //! - `parse` 的 opts（escape / splitUnquoted）未实现：claude-code 无调用方使用，
 //!   相应的 pendingNw / flushRun / words 分支一并省略。
@@ -21,12 +22,11 @@
 //! - JS 字符串下标按 UTF-16 code unit 计，Rust 按标量值（char）扫描；BMP 字符
 //!   完全一致，astral 字符（emoji 等）在 `parseEnvVar` 的 `i+1` 推进处有细微差异。
 //! - TS 的 `quote()` 在严格校验失败时先 `jsonStringify` 再二次引号，失败则抛错；
-//!   Rust 无 panic 路径，二次失败时退化为逐参数单引号兜底（对 `[String]` 输入
+//!   Rust 无 panic：二次失败时退化为逐参数单引号兜底（对 `[String]` 输入
 //!   严格路径恒成功，该分支实际不可达）。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
-use once_cell::sync::Lazy;
 use rand::Rng;
 use serde_json::Value;
 
@@ -157,7 +157,7 @@ fn is_glob_special(c: char) -> bool {
         )
 }
 
-/// quote.js 的 `["\s]`：空白、`"` 或 `'`。
+/// quote.js 的 `["'\s]`：空白、`"` 或 `'`。
 fn has_space_or_quote(s: &str) -> bool {
     s.chars().any(|c| is_js_whitespace(c) || c == '"' || c == '\'')
 }
@@ -234,7 +234,9 @@ pub fn quote_tokens(xs: &[ParseEntry]) -> Result<String, String> {
                     // 分支 1：同时含 ' 与 ! → 单引号包裹，内嵌 ' 用 '"'"' 转义。
                     let escaped = s.replace('\'', "'\"'\"'");
                     parts.push(format!("'{}'", escaped));
-                } else if (s.contains('"') || s.chars().any(is_js_whitespace) || s.contains('\\'))
+                } else if (s.contains('"')
+                    || s.chars().any(is_js_whitespace)
+                    || s.contains('\\'))
                     && !s.contains('\'')
                 {
                     // 分支 2：含 " / 空白 / \ 且不含 ' → 原样单引号（不转义）。
@@ -296,12 +298,9 @@ fn quote_escape_specials(s: &str) -> String {
     let mut i = 0usize;
     while i < chars.len() {
         // `([A-Za-z]:)?(special)`：盘符 + 冒号 + 特殊字符 → 仅转义特殊字符。
-        if i + 2 < chars.len() + 1
-            && i + 2 <= chars.len()
+        if i + 2 < chars.len()
             && chars[i].is_ascii_alphabetic()
-            && i + 1 < chars.len()
             && chars[i + 1] == ':'
-            && i + 2 < chars.len()
             && is_quote_special(chars[i + 2])
         {
             out.push(chars[i]);
@@ -322,86 +321,84 @@ fn quote_escape_specials(s: &str) -> String {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// parse（parse.js）
+// parse（parse.js）—— chunker
 // ────────────────────────────────────────────────────────────────────────────
 
-/// chunker 的 CONTROL 组：在位置 `i` 尝试匹配最长控制算符。
-/// 返回 (算符文本, 消费字节数)。顺序对齐 parse.js 的正则交替。
+/// chunker 的 CONTROL 组：在位置 `i` 尝试匹配控制算符。
+/// 返回 (算符文本, 消费字节数)。交替顺序对齐 parse.js。
 fn scan_control(s: &str, i: usize) -> Option<(&'static str, usize)> {
     let rest = &s[i..];
-    let two = |a: &str| rest.starts_with(a);
-    let three = |a: &str| rest.starts_with(a);
-    if two("||") {
+    if rest.starts_with("||") {
         return Some(("||", 2));
     }
-    if three("&&") {
+    if rest.starts_with("&&") {
         return Some(("&&", 2));
     }
-    if three("&>>") {
+    if rest.starts_with("&>>") {
         return Some(("&>>", 3));
     }
-    if two("&>") {
+    if rest.starts_with("&>") {
         return Some(("&>", 2));
     }
-    if three(";;&") {
+    if rest.starts_with(";;&") {
         return Some((";;&", 3));
     }
-    if two(";;") {
+    if rest.starts_with(";;") {
         return Some((";;", 2));
     }
-    if two(";&") {
+    if rest.starts_with(";&") {
         return Some((";&", 2));
     }
-    if two("|&") {
+    if rest.starts_with("|&") {
         return Some(("|&", 2));
     }
-    if two("<(") {
+    if rest.starts_with("<(") {
         return Some(("<(", 2));
     }
-    if three("<<<") {
+    if rest.starts_with("<<<") {
         return Some(("<<<", 3));
     }
-    if three("<<-") {
+    if rest.starts_with("<<-") {
         return Some(("<<-", 3));
     }
-    // `<<(?!()：`<<(` 拆成 `<` + `(`（zsh 读法）。
-    if two("<<") && !rest[2..].starts_with('(') {
+    // `<<(?!()`：`<<(` 拆成 `<` + `(`（zsh 读法）。
+    if rest.starts_with("<<") && !rest[2..].starts_with('(') {
         return Some(("<<", 2));
     }
-    if two(">>") {
+    if rest.starts_with(">>") {
         return Some((">>", 2));
     }
-    if two(">&") {
+    if rest.starts_with(">&") {
         return Some((">&", 2));
     }
-    if two(">|") {
+    if rest.starts_with(">|") {
         return Some((">|", 2));
     }
-    if two(">(") {
+    if rest.starts_with(">(") {
         return Some((">(", 2));
     }
-    if two("<&") {
+    if rest.starts_with("<&") {
         return Some(("<&", 2));
     }
-    if two("<>") {
+    if rest.starts_with("<>") {
         return Some(("<>", 2));
     }
-    let c = rest.chars().next()?;
-    if is_control_char(c) {
-        // 单字符算符：& ; ( ) | < >
-        let op = match c {
-            '&' => "&",
-            ';' => ";",
-            '(' => "(",
-            ')' => ")",
-            '|' => "|",
-            '<' => "<",
-            '>' => ">",
-            _ => return None,
-        };
-        return Some((op, c.len_utf8()));
+    match rest.chars().next() {
+        Some(c) if is_control_char(c) => {
+            let op = match c {
+                '&' => "&",
+                ';' => ";",
+                '(' => "(",
+                ')' => ")",
+                '|' => "|",
+                '<' => "<",
+                '>' => ">",
+                _ => return None,
+            };
+            Some((op, c.len_utf8()))
+        }
+        _ => None,
     }
-    None
 }
 
 /// 从 `"` 开始扫描双引号串，返回闭合后的字节位置（不含闭合引号则 None）。
@@ -471,8 +468,12 @@ fn bareword_consume(s: &str, i: usize) -> usize {
         }
     }
     if b == b'$' {
-        // `$$` 或单 `$`（ANSI_C 引用已在 chunker 层优先消费）。
-        return if i + 1 < bytes.len() && bytes[i + 1] == b'$' { 2 } else { 1 };
+        // `$$` 或单 `$`（ANSI_C 引用已在 chunker 层优先整体消费）。
+        return if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+            2
+        } else {
+            1
+        };
     }
     let c = b as char;
     if !is_js_whitespace(c) && c != '\'' && c != '"' && c != '$' && !is_meta(c) {
@@ -548,27 +549,30 @@ fn find_matches(s: &str) -> Vec<(usize, String)> {
     matches
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// parse（parse.js）—— ANSI-C 引用
+// ────────────────────────────────────────────────────────────────────────────
+
 /// ANSI-C 转义分类结果：(替换文本, 反斜杠后消费的字符数)。
-/// lookup 失败（如纯 `\\` 结尾）返回 None。
+/// 不匹配已知转义（如纯 `\` 结尾、`\q`）返回 None。
 fn classify_ansi_escape(rest: &[char]) -> Option<(String, usize)> {
     let first = *rest.first()?;
-    // `c(?:\\|[\s\S])`：后随任意一个字符。
+    // `c(?:\\|[\s\S])`：后随任意一个字符（含 `\`）。
     if first == 'c' {
         let ctrl = *rest.get(1)?;
         let ch = if ctrl == '?' {
             '\u{007F}'
         } else {
-            let cp = (ctrl as u32) & 0x1F;
-            char::from_u32(cp).unwrap_or(ctrl)
+            char::from_u32((ctrl as u32) & 0x1F).unwrap_or(ctrl)
         };
         return Some((ch.to_string(), 2));
     }
     // `[0-7]{1,3}`：八进制。
-    if first.is_ascii_digit() && first <= '7' {
+    if ('0'..='7').contains(&first) {
         let mut digits = String::new();
         for i in 0..3 {
             match rest.get(i) {
-                Some(d) if *d >= '0' && *d <= '7' => digits.push(*d),
+                Some(d) if ('0'..='7').contains(d) => digits.push(*d),
                 _ => break,
             }
         }
@@ -580,58 +584,53 @@ fn classify_ansi_escape(rest: &[char]) -> Option<(String, usize)> {
         ));
     }
     // `x[\dA-Fa-f]{1,2}` / `u{1,4}` / `U{1,8}`：十六进制。
-    let (max_len, marker_len) = match first {
-        'x' => (2, 1),
-        'u' => (4, 1),
-        'U' => (8, 1),
-        _ => {
-            // `[abeEfnrtv\\'"?]`：单字符集合。
-            let ch = match first {
-                'a' => '\u{0007}',
-                'b' => '\u{0008}',
-                'e' | 'E' => '\u{001B}',
-                'f' => '\u{000C}',
-                'n' => '\u{000A}',
-                'r' => '\u{000D}',
-                't' => '\u{0009}',
-                'v' => '\u{000B}',
-                '\\' | '\'' | '"' | '?' => first,
-                _ => return None,
-            };
-            return Some((ch.to_string(), 1));
+    if matches!(first, 'x' | 'u' | 'U') {
+        let max_len = if first == 'x' { 2 } else if first == 'u' { 4 } else { 8 };
+        let mut hex = String::new();
+        for i in 0..max_len {
+            match rest.get(1 + i) {
+                Some(d) if d.is_ascii_hexdigit() => hex.push(*d),
+                _ => break,
+            }
         }
-    };
-    let mut hex = String::new();
-    for i in 0..max_len {
-        match rest.get(1 + i) {
-            Some(d) if d.is_ascii_hexdigit() => hex.push(*d),
-            _ => break,
+        if hex.is_empty() {
+            return None;
         }
-    }
-    if hex.is_empty() {
-        return None;
-    }
-    let cp = u32::from_str_radix(&hex, 16).ok()?;
-    if cp > 0x10FFFF {
-        // expandAnsiCEscape 返回原匹配 m（含反斜杠）。
-        let mut original = String::from("\\");
-        original.push(first);
-        original.push_str(&hex);
-        return Some((original, 1 + hex.len()));
-    }
-    match char::from_u32(cp) {
-        Some(c) => Some((c.to_string(), 1 + hex.len())),
-        None => {
-            // 孤立代理项（JS 可表示、Rust 不能）：退化为字面量。
+        let consumed = 1 + hex.len();
+        let cp = u32::from_str_radix(&hex, 16).ok()?;
+        if cp > 0x10FFFF {
+            // expandAnsiCEscape 对超范围返回原匹配 m（含反斜杠）。
             let mut original = String::from("\\");
             original.push(first);
             original.push_str(&hex);
-            Some((original, 1 + hex.len()))
+            return Some((original, consumed));
         }
+        if let Some(c) = char::from_u32(cp) {
+            return Some((c.to_string(), consumed));
+        }
+        // 孤立代理项（JS 可表示、Rust 不能）：退化为字面量。
+        let mut original = String::from("\\");
+        original.push(first);
+        original.push_str(&hex);
+        return Some((original, consumed));
     }
+    // `[abeEfnrtv\\'"?]`：单字符集合（ANSI_C_LETTERS/CHARS 映射）。
+    let ch = match first {
+        'a' => '\u{0007}',
+        'b' => '\u{0008}',
+        'e' | 'E' => '\u{001B}',
+        'f' => '\u{000C}',
+        'n' => '\u{000A}',
+        'r' => '\u{000D}',
+        't' => '\u{0009}',
+        'v' => '\u{000B}',
+        '\\' | '\'' | '"' | '?' => first,
+        _ => return None,
+    };
+    Some((ch.to_string(), 1))
 }
 
-/// expandAnsiC(body)：展开 `\\x` / `\\n` / `\\cX` 等转义，NUL 截断。
+/// expandAnsiC(body)：展开 `\x` / `\n` / `\cX` 等转义，NUL 截断。
 fn expand_ansi_c(body: &str) -> String {
     let chars: Vec<char> = body.chars().collect();
     let mut out = String::with_capacity(body.len());
@@ -692,8 +691,12 @@ fn closes_ansi_c(chars: &[(usize, char)], ci: usize) -> Option<usize> {
     None
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// parse（parse.js）—— chunk 状态机
+// ────────────────────────────────────────────────────────────────────────────
+
 /// parseEnvVar：消费 `$` 后的变量名并查询 env（getVar）。
-/// `*ci` 的语义与 parse.js 一致：返回时指向让外层 `i++` 落在正确位置处。
+/// `*ci` 的语义与 parse.js 一致：返回时为让外层 `i++` 落在正确位置处的值。
 fn parse_env_var(
     chars: &[(usize, char)],
     ci: &mut usize,
@@ -703,13 +706,12 @@ fn parse_env_var(
     // i += 1：跳过 `$`。
     *ci += 1;
     let len = chars.len();
-    let char_at = |i: usize| chars.get(i).map(|p| p.1);
-    let first = char_at(*ci);
+    let first = chars.get(*ci).map(|p| p.1);
     let varname: String;
     if first == Some('{') {
         *ci += 1;
-        if char_at(*ci) == Some('}') {
-            // `throw new Error('Bad substitution: ' + s.slice(i - 2, i + 1))`。
+        if chars.get(*ci).map(|p| p.1) == Some('}') {
+            // `throw new Error('Bad substitution: ' + s.slice(i - 2, i + 1))` → "${}"。
             return Err("Bad substitution: ${}".into());
         }
         // 按花括号深度匹配，嵌套 `${` 的内部 `}` 不结束外层替换。
@@ -725,18 +727,28 @@ fn parse_env_var(
             varend += 1;
         }
         if depth != 0 {
-            return Err("Bad substitution: ${".to_string() + &subslice(chars, *ci));
+            // `throw new Error('Bad substitution: ' + s.slice(i))`。
+            let rest: String = chars.iter().skip(*ci).map(|p| p.1).collect();
+            return Err(format!("Bad substitution: {rest}"));
         }
         let close = varend - 1; // `}` 的字符索引
-        varname = subslice(chars, *ci, close);
+        varname = chars
+            .iter()
+            .skip(*ci)
+            .take(close - *ci)
+            .map(|p| p.1)
+            .collect();
         *ci = close;
-    } else if matches!(first, Some('*') | Some('@') | Some('#') | Some('?') | Some('$') | Some('!') | Some('-')) {
+    } else if matches!(
+        first,
+        Some('*') | Some('@') | Some('#') | Some('?') | Some('$') | Some('!') | Some('-')
+    ) {
+        // 特殊变量名单字符；不移动 ci（外层 i++ 跳过它）。
         varname = first.map(|c| c.to_string()).unwrap_or_default();
-        // varname 为当前单字符；不移动 ci（外层 i++ 跳过它）。
     } else {
         // `[^\w\d_]` 边界：消费最大 [A-Za-z0-9_] 串。
         let vstart = *ci;
-        let mut wend = *ci;
+        let mut wend = vstart;
         while wend < len {
             let ch = chars[wend].1;
             if ch.is_ascii_alphanumeric() || ch == '_' {
@@ -745,24 +757,29 @@ fn parse_env_var(
                 break;
             }
         }
-        if wend == len && vstart < len {
+        if wend == len {
             // `!varend`：剩余全部是 word 字符 → varname 为全部，i = s.length。
-            varname = subslice(chars, vstart);
-            *ci = len; // 循环条件退出
+            varname = chars.iter().skip(vstart).map(|p| p.1).collect();
+            *ci = len;
         } else if wend == vstart {
             // varend.index == 0：varname 为空，i 回退一位（外层 ++ 回到原位）。
             varname = String::new();
             *ci = vstart - 1;
         } else {
-            varname = subslice(chars, vstart, wend);
+            varname = chars
+                .iter()
+                .skip(vstart)
+                .take(wend - vstart)
+                .map(|p| p.1)
+                .collect();
             *ci = wend - 1;
         }
     }
     // getVar(env, '', varname)
-    let value = match lookup(&varname) {
+    Ok(match lookup(&varname) {
         Some(EnvValue::Str(s)) => s,
         Some(EnvValue::Json(v)) => match serde_json::to_string(&v) {
-            Ok(json) => format!("{}{}{}", token, json, token),
+            Ok(json) => format!("{token}{json}{token}"),
             Err(e) => return Err(e.to_string()),
         },
         None => {
@@ -772,26 +789,7 @@ fn parse_env_var(
                 String::new()
             }
         }
-    };
-    Ok(value)
-}
-
-/// 取 chars[begin..end)（按字符区间）的字符串；省略 end 表示到末尾。
-fn subslice(chars: &[(usize, char)], begin: usize) -> String {
-    chars
-        .iter()
-        .skip(begin)
-        .map(|p| p.1)
-        .collect()
-}
-
-fn subslice_range(chars: &[(usize, char)], begin: usize, end: usize) -> String {
-    chars
-        .iter()
-        .skip(begin)
-        .take(end.saturating_sub(begin))
-        .map(|p| p.1)
-        .collect()
+    })
 }
 
 enum ChunkOutcome {
@@ -838,40 +836,31 @@ fn process_chunk(
             if c == q {
                 quote = None;
             } else if q == '\'' {
+                // 单引号内一切字面。
                 out.push(c);
-            } else {
-                // 双引号内：`\` 仅转义 `" \ $`；`$` 触发展开；其余原样。
-                if c == '\\' {
-                    let next = chars.get(ci + 1).map(|p| p.1);
-                    match next {
-                        Some(n) if n == '"' || n == '\\' || n == '$' => {
-                            out.push(n);
-                            ci += 2;
-                        }
-                        Some(n) => {
-                            out.push('\\');
-                            out.push(n);
-                            ci += 2;
-                        }
-                        None => {
-                            out.push('\\');
-                        }
+            } else if c == '\\' {
+                // 双引号内：`\` 仅脱义 `" \ $`，其余保留反斜杠；
+                // `\` + 一个字符 = i 多进 1（循环再 +1，共 +2）。
+                match chars.get(ci + 1).map(|p| p.1) {
+                    Some(n) if n == '"' || n == '\\' || n == '$' => {
+                        out.push(n);
+                        ci += 1;
                     }
-                    if ci > len {
-                        // 双字符转义越界保护（理论不可达）。
-                        break;
+                    Some(n) => {
+                        out.push('\\');
+                        out.push(n);
+                        ci += 1;
                     }
-                    ci -= 1; // 抵消循环末尾的 ci += 1
-                } else if c == '$' {
-                    let value = parse_env_var(&chars, &mut ci, lookup, token)?;
-                    out.push_str(&value);
-                    if ci + 1 > len {
-                        break;
+                    None => {
+                        out.push('\\');
                     }
-                    ci -= 1; // parse_env_var 已预留，抵消循环 +1
-                } else {
-                    out.push(c);
                 }
+            } else if c == '$' {
+                let value = parse_env_var(&chars, &mut ci, lookup, token)?;
+                out.push_str(&value);
+                // parse_env_var 已按 JS 语义留好位置，直接靠循环 +1 落位。
+            } else {
+                out.push(c);
             }
         } else if c == '"' || c == '\'' {
             quote = Some(c);
@@ -904,25 +893,23 @@ fn process_chunk(
             esc = true;
         } else if c == '$' && chars.get(ci + 1).map(|p| p.1) == Some('\'') {
             if let Some(close) = closes_ansi_c(&chars, ci) {
-                // `$'...'`：body 展开后拼入。i = lastIndex - 1（外层 +1 到 close）。
-                let body = subslice_range(&chars, ci + 2, close - 1);
+                // `$'...'`：body 展开后拼入；i = lastIndex - 1（循环 +1 到 close）。
+                let body: String = chars
+                    .iter()
+                    .skip(ci + 2)
+                    .take((close - 1).saturating_sub(ci + 2))
+                    .map(|p| p.1)
+                    .collect();
                 out.push_str(&expand_ansi_c(&body));
                 ci = close - 1;
             } else {
+                // 串内未闭合的 `$'`：退回普通 `$` 展开。
                 let value = parse_env_var(&chars, &mut ci, lookup, token)?;
                 out.push_str(&value);
-                if ci + 1 > len {
-                    break;
-                }
-                ci -= 1;
             }
         } else if c == '$' {
             let value = parse_env_var(&chars, &mut ci, lookup, token)?;
             out.push_str(&value);
-            if ci + 1 > len {
-                break;
-            }
-            ci -= 1; // parse_env_var 让 ci 停在让 +1 落位处
         } else {
             out.push(c);
         }
@@ -937,7 +924,8 @@ fn process_chunk(
     Ok(ChunkOutcome::Many(vec![ParseEntry::Str(out)]))
 }
 
-/// 函数 env 的 TOKEN 往返（parse.js module.exports 的 reduce 后处理）。
+/// 函数 env 的 TOKEN 往返（parse.js module.exports 的 reduce 后处理）：
+/// 字符串 token 按 TOKEN…TOKEN 段切分，防 TOKEN 段 JSON.parse 回对象。
 fn post_process_fn_env(mapped: Vec<ParseEntry>, token: &str) -> Result<Vec<ParseEntry>, String> {
     let mut acc: Vec<ParseEntry> = Vec::new();
     for entry in mapped {
@@ -952,73 +940,70 @@ fn post_process_fn_env(mapped: Vec<ParseEntry>, token: &str) -> Result<Vec<Parse
             acc.push(ParseEntry::Str(s));
             continue;
         }
-        // s.split(RegExp('(' + TOKEN + '.*?' + TOKEN + ')', 'g'))：按
-        // TOKEN…TOKEN 段切分（JS `.` 排除换行；此处按首次出现切分，差异见模块注释）。
-        let mut rest = s.as_str();
+        // s.split(RegExp('(' + TOKEN + '.*?' + TOKEN + ')', 'g'))：
+        // JS `.` 排除换行；此处按首次出现切分，差异见模块注释。
+        let mut rest: &str = &s;
         loop {
-            match rest.find(token) {
-                Some(start) => {
-                    let after_first = &rest[start + token.len()..];
-                    match after_first.find(token) {
-                        Some(rel) => {
-                            let prefix = &rest[..start];
-                            if !prefix.is_empty() {
-                                acc.push(ParseEntry::Str(prefix.to_string()));
-                            }
-                            let json = &after_first[..rel];
-                            match serde_json::from_str::<Value>(json) {
-                                Ok(Value::Object(map)) => {
-                                    if let Some(op) = map.get("op").and_then(Value::as_str) {
-                                        if op == "glob" {
-                                            if let Some(pattern) =
-                                                map.get("pattern").and_then(Value::as_str)
-                                            {
-                                                acc.push(ParseEntry::Glob {
-                                                    pattern: pattern.to_string(),
-                                                });
-                                                continue_with_next(&mut acc);
-                                            }
-                                        } else {
-                                            acc.push(ParseEntry::Control {
-                                                op: op.to_string(),
-                                            });
-                                            continue_with_next(&mut acc);
-                                        }
-                                    } else if let Some(comment) =
-                                        map.get("comment").and_then(Value::as_str)
-                                    {
-                                        acc.push(ParseEntry::Comment {
-                                            comment: comment.to_string(),
-                                        });
-                                    }
-                                    // 未知 JSON 形状：丢弃（模块注释有说明）。
-                                }
-                                _ => return Err(format!("Invalid JSON in env expansion: {json}")),
-                            }
-                            rest = &after_first[rel + token.len()..];
-                        }
-                        None => {
-                            if !rest.is_empty() {
-                                acc.push(ParseEntry::Str(rest.to_string()));
-                            }
-                            break;
-                        }
-                    }
-                }
+            let start = match rest.find(token) {
+                Some(p) => p,
                 None => {
                     if !rest.is_empty() {
                         acc.push(ParseEntry::Str(rest.to_string()));
                     }
                     break;
                 }
+            };
+            let after_first = &rest[start + token.len()..];
+            let rel = match after_first.find(token) {
+                Some(r) => r,
+                None => {
+                    // 落单 TOKEN：剩余按原样保留（JS filter(Boolean) 后等价）。
+                    if !rest.is_empty() {
+                        acc.push(ParseEntry::Str(rest.to_string()));
+                    }
+                    break;
+                }
+            };
+            if start > 0 {
+                acc.push(ParseEntry::Str(rest[..start].to_string()));
             }
+            let json = &after_first[..rel];
+            let parsed = serde_json::from_str::<Value>(json)
+                .map_err(|e| format!("Invalid JSON in env expansion: {e}"))?;
+            push_json_entry(&mut acc, parsed)?;
+            rest = &after_first[rel + token.len()..];
         }
     }
     Ok(acc)
 }
 
-// 仅供 post_process_fn_env 保持 clippy happy 的占位（无副作用）。
-fn continue_with_next(_acc: &mut Vec<ParseEntry>) {}
+/// 将 JSON 往返的对象映射为 ParseEntry：op / glob / comment 三种已知形状。
+fn push_json_entry(acc: &mut Vec<ParseEntry>, value: Value) -> Result<(), String> {
+    let map = match value {
+        Value::Object(map) => map,
+        _ => return Err("Invalid JSON in env expansion: expected object".into()),
+    };
+    if let Some(op) = map.get("op").and_then(|v| v.as_str()) {
+        if op == "glob" {
+            if let Some(pattern) = map.get("pattern").and_then(|v| v.as_str()) {
+                acc.push(ParseEntry::Glob {
+                    pattern: pattern.to_string(),
+                });
+            }
+            // glob 缺 pattern → 视为未知形状：丢弃。
+        } else {
+            acc.push(ParseEntry::Control {
+                op: op.to_string(),
+            });
+        }
+    } else if let Some(comment) = map.get("comment").and_then(|v| v.as_str()) {
+        acc.push(ParseEntry::Comment {
+            comment: comment.to_string(),
+        });
+    }
+    // 其余未知形状：丢弃（模块注释有说明）。
+    Ok(())
+}
 
 /// shell-quote `parse(s, env, opts)`。opts 未实现（见模块注释）。
 fn parse_shell(string: &str, env: Option<&ShellEnv<'_>>) -> Result<Vec<ParseEntry>, String> {
@@ -1038,9 +1023,8 @@ fn parse_shell(string: &str, env: Option<&ShellEnv<'_>>) -> Result<Vec<ParseEntr
     let mut mapped: Vec<ParseEntry> = Vec::new();
     for (start, chunk) in &matches {
         let outcome = process_chunk(chunk, *start, string, &lookup, &token, &mut commented)?;
-        match outcome {
-            ChunkOutcome::Many(entries) => mapped.extend(entries),
-            ChunkOutcome::None => {}
+        if let ChunkOutcome::Many(entries) = outcome {
+            mapped.extend(entries);
         }
     }
     if env.map_or(false, |e| matches!(e, ShellEnv::Function(_))) {
@@ -1069,9 +1053,8 @@ pub fn try_parse_shell_command(cmd: &str, env: Option<ShellEnv<'_>>) -> ShellPar
 /// tryQuoteShellArgs：严格校验 + 引号。
 /// TS 拒绝 object/symbol/function 参数；Rust 入参为 String，校验恒通过。
 pub fn try_quote_shell_args(args: &[String]) -> ShellQuoteResult {
-    match quote_tokens(
-        &args.iter().cloned().map(ParseEntry::Str).collect::<Vec<_>>(),
-    ) {
+    let tokens: Vec<ParseEntry> = args.iter().cloned().map(ParseEntry::Str).collect();
+    match quote_tokens(&tokens) {
         Ok(quoted) => ShellQuoteResult::Success { quoted },
         Err(error) => {
             log_error(anyhow::anyhow!(error.clone()));
@@ -1092,9 +1075,8 @@ pub fn quote(args: &[String]) -> String {
         .iter()
         .map(|a| json_stringify(&Value::String(a.clone())))
         .collect();
-    if let Ok(quoted) = quote_tokens(
-        &json_args.iter().cloned().map(ParseEntry::Str).collect::<Vec<_>>(),
-    ) {
+    let tokens: Vec<ParseEntry> = json_args.iter().cloned().map(ParseEntry::Str).collect();
+    if let Ok(quoted) = quote_tokens(&tokens) {
         return quoted;
     }
     // SECURITY：绝不返回未加引号的内容；最终兜底为逐参数单引号。
