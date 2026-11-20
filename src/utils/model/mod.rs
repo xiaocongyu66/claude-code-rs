@@ -6,3 +6,4 @@ pub mod configs;
 pub mod providers;
 pub mod deprecation;
 pub mod model_support_overrides;
+pub mod model;

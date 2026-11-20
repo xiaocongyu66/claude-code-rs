@@ -267,7 +267,7 @@ pub fn get_small_fast_model() -> ModelName {
         }
     }
     // Anthropic 专属或兜底
-    env_nonempty("ANTHROPIC_SMALL_FAST_MODEL").unwrap_or_else(|_| get_default_haiku_model())
+    env_nonempty("ANTHROPIC_SMALL_FAST_MODEL").unwrap_or_else(|| get_default_haiku_model())
 }
 
 /// `isNonCustomOpusModel`：是否为内置 Opus 模型（非自定义 ID）。
@@ -426,14 +426,14 @@ pub fn get_runtime_main_loop_model(
 ) -> ModelName {
     let user_setting = get_user_specified_model_setting();
 
-    if matches!(user_setting, Some(Some(ref m)) if m == "opusplan")
+    if matches!(user_setting, Some(Some(ref m)) if m.as_str() == "opusplan")
         && permission_mode == PermissionMode::Plan
         && !exceeds_200k_tokens
     {
         return get_default_opus_model();
     }
 
-    if matches!(user_setting, Some(Some(ref m)) if m == "haiku")
+    if matches!(user_setting, Some(Some(ref m)) if m.as_str() == "haiku")
         && permission_mode == PermissionMode::Plan
     {
         return get_default_sonnet_model();
@@ -451,6 +451,13 @@ pub fn get_runtime_main_loop_model(
 pub fn get_default_main_loop_model_setting() -> ModelName {
     if is_ant_user() {
         // TS: `(getAntModelOverrideConfig()?.defaultModel as string) ?? getDefaultOpusModel() + '[1m]'`
+        // antModels.ts 未转换 → getAntModelOverrideConfig 占位 None，
+        // 恒走 `??` 的 fallback 分支（默认 Opus + [1m]，见模块头）。
+        if let Some(config) = get_ant_model_override_config() {
+            if let Some(default_model) = config.default_model {
+                return default_model;
+            }
+        }
         return format!("{}[1m]", get_default_opus_model());
     }
 
@@ -1006,8 +1013,8 @@ pub fn is_model_allowed(model: &str) -> bool {
     // 跳过——["opus", "opus-4-5"] 中的 "opus" 不应直接命中，
     // 管理员意图是仅限 opus 4.5。
     if normalized_allowlist.iter().any(|entry| entry == &normalized_model)
-        && !is_model_family_alias(&normalized_model)
-        && !family_has_specific_entries(&normalized_model, &normalized_allowlist)
+        && (!is_model_family_alias(&normalized_model)
+            || !family_has_specific_entries(&normalized_model, &normalized_allowlist))
     {
         return true;
     }
