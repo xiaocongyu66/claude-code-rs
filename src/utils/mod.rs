@@ -90,3 +90,4 @@ pub mod sleep;
 pub mod model;
 pub mod context;
 pub mod model_cost;
+pub mod auth;

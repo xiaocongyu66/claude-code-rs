@@ -10,8 +10,10 @@
 //!   `is_consumer_subscriber`、`is_1p_api_customer` 等）为纯逻辑实现；
 //! - `apiKeyHelper` / `awsAuthRefresh` / `gcpAuthRefresh` /
 //!   `awsCredentialExport` / `otelHeadersHelper` 均为「shell 命令执行 +
-//!   结果缓存」模型，用 tokio process 实现；
-//! - macOS keychain 通过 `security` CLI 子进程实现（对齐 TS subprocess 调用）。
+//!   结果缓存」模型，用 tokio/std process 实现；
+//! - macOS keychain 通过 `security` CLI 子进程实现（对齐 TS subprocess 调用）；
+//! - 401 处理与 token 刷新流程（跨进程锁、in-flight 去重、重试退避）完整落地，
+//!   仅真正发起 HTTP 的一步留占位。
 //!
 //! ## 需要 reqwest 的函数（以 `AuthError::HttpClientUnavailable` 占位）
 //! - [`refresh_oauth_token`]：POST `${token_url}`（grant_type=refresh_token）
@@ -28,7 +30,9 @@
 //!   `should_use_claude_ai_auth` 两个纯函数在本模块内实现；
 //! - `services/mockRateLimits.ts` 未移植：mock 订阅状态用本模块全局
 //!   `Mutex` 近似（setter 仅供测试）；
+//! - `utils/config.ts` 未移植：`~/.claude.json` 读写在本模块内 duck-type；
 //! - `otelHeadersHelper` 的 30s 超时未强制（std::process 无 deadline）；
+//! - `otelHeadersHelper` 返回 `Vec<(String, String)>` 保序（TS 为 Record）；
 //! - `getOauthConfig()` 失败时（如自定义 OAuth URL 非白名单）回退默认值，
 //!   不像 TS 那样抛出——auth 层调用点全部是尽力读取。
 
@@ -37,7 +41,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -61,6 +65,7 @@ use crate::utils::env_utils::{
 use crate::utils::errors::error_message;
 use crate::utils::log::log_error;
 use crate::utils::memoize::{memoize_with_ttl_async, TtlMemoizedAsync};
+use crate::utils::model::provider_classification::{is_third_party_api_provider, ApiProvider};
 use crate::utils::platform::{get_platform, Platform};
 use crate::utils::settings::settings::{get_initial_settings, get_settings_for_source};
 use crate::utils::settings::types::{ModelTypeSetting, SettingsJson};
@@ -102,7 +107,7 @@ const MAX_LOCK_RETRIES: u32 = 5;
 /// TS `MACRO.FEEDBACK_CHANNEL`（构建期 define，当前为空串）。
 const FEEDBACK_CHANNEL: &str = "";
 
-/// TS `errorMessage`/`chalk` 之外的安全提示前缀。
+/// TS 安全提示前缀（TS 为模板拼接，此处提取为常量保持文案一致）。
 const SECURITY_PREFIX: &str = "Security:";
 
 // ---------------------------------------------------------------------------
@@ -170,7 +175,7 @@ pub struct SaveStatus {
 // ---------------------------------------------------------------------------
 
 /// `SubscriptionType`：TS 侧实际为 `any`，取值见 oauth/client.ts 的判定分支。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubscriptionType {
     Free,
@@ -321,7 +326,7 @@ pub struct AwsCredentials {
 // 通用薄封装
 // ---------------------------------------------------------------------------
 
-/// `process.env[name]`。
+/// `process.env[name]`（空串视为未设置，对齐 TS 真值判断）。
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
@@ -398,12 +403,10 @@ fn get_global_config() -> Value {
             return config.clone();
         }
     }
-    let config = (|| -> Value {
-        match std::fs::read(get_global_claude_file()) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::Object(Default::default())),
-            Err(_) => Value::Object(Default::default()),
-        }
-    })();
+    let config = match std::fs::read(get_global_claude_file()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::Object(Default::default())),
+        Err(_) => Value::Object(Default::default()),
+    };
     *lock(&GLOBAL_CONFIG_CACHE) = Some(config.clone());
     config
 }
@@ -420,9 +423,7 @@ fn save_global_config(updater: &dyn Fn(&Value) -> Value) {
     match serde_json::to_vec_pretty(&updated) {
         Ok(bytes) => {
             let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &bytes).is_ok()
-                && std::fs::rename(&tmp, &path).is_ok()
-            {
+            if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
                 *lock(&GLOBAL_CONFIG_CACHE) = Some(updated);
             }
         }
@@ -430,7 +431,7 @@ fn save_global_config(updater: &dyn Fn(&Value) -> Value) {
     }
 }
 
-/// config 中 `customApiKeyResponses.approved` 是否包含某 key。
+/// config 中 `customApiKeyResponses.approved` 列表。
 fn config_approved_api_keys(config: &Value) -> Vec<String> {
     config
         .get("customApiKeyResponses")
@@ -581,7 +582,6 @@ fn maybe_persist_token_for_subprocesses(path: &str, token: &str, label: &str) {
                 .truncate(true)
                 .open(path)?;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            use std::io::Write as _;
             file.write_all(token.as_bytes())?;
         }
         #[cfg(not(unix))]
@@ -681,13 +681,9 @@ fn secure_storage_path() -> PathBuf {
 /// 读 `.credentials.json`；缺失/损坏返回 None（错误记录到日志）。
 fn read_secure_storage() -> Option<Value> {
     match std::fs::read(secure_storage_path()) {
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(value) => Some(value),
-            Err(e) => {
-                log_error(e);
-                None
-            }
-        },
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .map_err(|e| log_error(e))
+            .ok(),
         Err(e) => {
             // ENOENT 是常态（未登录），不噪音。
             if e.kind() != std::io::ErrorKind::NotFound {
@@ -700,13 +696,9 @@ fn read_secure_storage() -> Option<Value> {
 
 async fn read_secure_storage_async() -> Option<Value> {
     match tokio::fs::read(secure_storage_path()).await {
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(value) => Some(value),
-            Err(e) => {
-                log_error(e);
-                None
-            }
-        },
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .map_err(|e| log_error(e))
+            .ok(),
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
                 log_error(e);
@@ -740,11 +732,7 @@ fn mac_os_keychain_storage_service_name() -> String {
     } else {
         let mut hasher = Sha256::new();
         hasher.update(config_dir.as_bytes());
-        let hex: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
         format!("-{}", &hex[..8])
     };
     let suffix = get_oauth_config()
@@ -781,7 +769,7 @@ fn keychain_read() -> Option<String> {
     }
 }
 
-/// `security delete-generic-password -a $USER -s "..."`，失败时抛错。
+/// `security delete-generic-password -a $USER -s "..."`，失败时返回 Err。
 fn keychain_delete() -> AuthResult<()> {
     let service = mac_os_keychain_storage_service_name();
     let output = std::process::Command::new("sh")
@@ -811,16 +799,19 @@ fn keychain_write(api_key: &str) -> AuthResult<()> {
         .stderr(Stdio::null())
         .spawn()?;
     {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            AuthError::Io("failed to open security stdin".to_string())
-        })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AuthError::Io("failed to open security stdin".to_string()))?;
         stdin.write_all(command.as_bytes())?;
     }
     let status = child.wait()?;
     if status.success() {
         Ok(())
     } else {
-        Err(AuthError::Io("security -i add-generic-password failed".to_string()))
+        Err(AuthError::Io(
+            "security -i add-generic-password failed".to_string(),
+        ))
     }
 }
 
@@ -829,13 +820,10 @@ fn maybe_remove_api_key_from_macos_keychain() -> AuthResult<()> {
     if get_platform() != Platform::Macos {
         return Ok(());
     }
-    match keychain_delete() {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            log_error(e);
-            Ok(())
-        }
+    if let Err(e) = keychain_delete() {
+        log_error(e);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -895,7 +883,7 @@ pub fn should_use_claude_ai_auth(scopes: &[String]) -> bool {
     scopes.iter().any(|s| s == CLAUDE_AI_INFERENCE_SCOPE)
 }
 
-/// TS `checkAndRefreshOAuthTokenIfNeeded` 依赖的"是否仍过期"双检语义。
+/// 「有 refresh token 且已过期」双条件（TS 刷新流程的守卫语义）。
 fn still_expired(tokens: &Option<OAuthTokens>) -> bool {
     match tokens {
         Some(t) => t.refresh_token.is_some() && is_oauth_token_expired(t.expires_at),
@@ -931,8 +919,7 @@ fn compute_claude_ai_oauth_tokens() -> Option<OAuthTokens> {
         return Some(OAuthTokens::inference_only(token));
     }
     // 明文 SecureStorage 后端。
-    let storage = read_secure_storage();
-    let oauth = storage.and_then(|s| s.get("claudeAiOauth").cloned());
+    let oauth = read_secure_storage().and_then(|s| s.get("claudeAiOauth").cloned());
     match oauth {
         Some(o) => match serde_json::from_value::<OAuthTokens>(o) {
             Ok(tokens) if !tokens.access_token.is_empty() => Some(tokens),
@@ -965,8 +952,9 @@ pub async fn get_claude_ai_oauth_tokens_async() -> AuthResult<Option<OAuthTokens
     {
         return Ok(get_claude_ai_oauth_tokens());
     }
-    let storage = read_secure_storage_async().await;
-    let oauth = storage.and_then(|s| s.get("claudeAiOauth").cloned());
+    let oauth = read_secure_storage_async()
+        .await
+        .and_then(|s| s.get("claudeAiOauth").cloned());
     match oauth {
         Some(o) => match serde_json::from_value::<OAuthTokens>(o) {
             Ok(tokens) if !tokens.access_token.is_empty() => Ok(Some(tokens)),
@@ -1012,12 +1000,10 @@ pub fn save_oauth_tokens_if_needed(tokens: &OAuthTokens) -> SaveStatus {
         log_event("tengu_oauth_tokens_inference_only");
         return SaveStatus { success: true, warning: None };
     }
-    let existing_subscription = read_secure_storage()
-        .and_then(|s| s.get("claudeAiOauth").cloned())
-        .and_then(|o| o.get("subscriptionType").cloned());
-    let existing_tier = read_secure_storage()
-        .and_then(|s| s.get("claudeAiOauth").cloned())
-        .and_then(|o| o.get("rateLimitTier").cloned());
+    // 刷新时 profile 拉取可能返回 null——不清掉已存的合法值。
+    let existing = read_secure_storage().and_then(|s| s.get("claudeAiOauth").cloned());
+    let existing_subscription = existing.as_ref().and_then(|o| o.get("subscriptionType").cloned());
+    let existing_tier = existing.as_ref().and_then(|o| o.get("rateLimitTier").cloned());
 
     let mut storage = read_secure_storage().unwrap_or_else(|| Value::Object(Default::default()));
     let oauth = serde_json::json!({
@@ -1025,12 +1011,13 @@ pub fn save_oauth_tokens_if_needed(tokens: &OAuthTokens) -> SaveStatus {
         "refreshToken": tokens.refresh_token,
         "expiresAt": tokens.expires_at,
         "scopes": tokens.scopes,
-        // 刷新时 profile 拉取可能返回 null——不清掉已存的合法值。
-        "subscriptionType": tokens.subscription_type.as_ref().map(|s| Value::String(s.as_str().to_string())).or(existing_subscription),
+        "subscriptionType": tokens
+            .subscription_type
+            .map(|s| Value::String(s.as_str().to_string()))
+            .or(existing_subscription),
         "rateLimitTier": tokens.rate_limit_tier.clone().map(Value::String).or(existing_tier),
     });
-    let obj = storage.as_object_mut();
-    if let Some(obj) = obj {
+    if let Some(obj) = storage.as_object_mut() {
         obj.insert("claudeAiOauth".to_string(), oauth);
     }
     match update_secure_storage(&storage) {
@@ -1040,7 +1027,7 @@ pub fn save_oauth_tokens_if_needed(tokens: &OAuthTokens) -> SaveStatus {
             SaveStatus { success: true, warning: None }
         }
         Err(e) => {
-            log_error(e.clone());
+            log_error(e);
             SaveStatus {
                 success: false,
                 warning: Some("Failed to save OAuth tokens".to_string()),
@@ -1054,8 +1041,7 @@ pub fn save_oauth_tokens_if_needed(tokens: &OAuthTokens) -> SaveStatus {
 // ---------------------------------------------------------------------------
 
 /// TS `getAPIProvider`（providers.ts 尚未移植，纯逻辑内联）。
-fn get_api_provider(settings: &SettingsJson) -> crate::utils::model::provider_classification::ApiProvider {
-    use crate::utils::model::provider_classification::ApiProvider;
+fn get_api_provider(settings: &SettingsJson) -> ApiProvider {
     if let Some(model_type) = settings.model_type {
         match model_type {
             ModelTypeSetting::Openai => return ApiProvider::Openai,
@@ -1097,16 +1083,14 @@ pub fn is_anthropic_auth_enabled() -> bool {
         return env("CLAUDE_CODE_OAUTH_TOKEN").is_some();
     }
     let settings = get_initial_settings();
-    let is_3p = crate::utils::model::provider_classification::is_third_party_api_provider(
-        get_api_provider(&settings),
-    ) || env("OPENAI_BASE_URL").is_some()
+    let is_3p = is_third_party_api_provider(get_api_provider(&settings))
+        || env("OPENAI_BASE_URL").is_some()
         || env("GEMINI_BASE_URL").is_some();
     if is_3p {
         return false;
     }
-    let api_key_helper = settings.api_key_helper.clone();
     let has_external_auth_token = env("ANTHROPIC_AUTH_TOKEN").is_some()
-        || api_key_helper.is_some()
+        || settings.api_key_helper.is_some()
         || env("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR").is_some();
     // API key 是否来自外部（非 /login 管理）。
     let (_, api_key_source) = get_anthropic_api_key_with_source(GetApiKeyOpts {
@@ -1139,22 +1123,17 @@ pub fn get_auth_token_source() -> (AuthTokenSource, bool) {
         return (AuthTokenSource::ClaudeCodeOauthToken, true);
     }
     // FD（或其 CCR 磁盘兜底）来源的 OAuth token。
-    if let Some(_token) = get_oauth_token_from_file_descriptor() {
+    if get_oauth_token_from_file_descriptor().is_some() {
         // 区分 FD 与磁盘兜底，避免 org-mismatch 提示让用户去删不存在的 env var。
         return if env("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR").is_some() {
-            (
-                AuthTokenSource::ClaudeCodeOauthTokenFileDescriptor,
-                true,
-            )
+            (AuthTokenSource::ClaudeCodeOauthTokenFileDescriptor, true)
         } else {
             (AuthTokenSource::CcrOauthTokenFile, true)
         };
     }
     // apiKeyHelper 配置存在性检查（不执行，防 trust 前执行任意代码）。
-    if let Some(_helper) = get_configured_api_key_helper() {
-        if !is_managed_oauth_context() {
-            return (AuthTokenSource::ApiKeyHelper, true);
-        }
+    if get_configured_api_key_helper().is_some() && !is_managed_oauth_context() {
+        return (AuthTokenSource::ApiKeyHelper, true);
     }
     let oauth_tokens = get_claude_ai_oauth_tokens();
     if let Some(tokens) = oauth_tokens.as_ref() {
@@ -1190,10 +1169,9 @@ pub fn has_anthropic_api_key_auth() -> bool {
     key.is_some() && source != ApiKeySource::None
 }
 
-/// TS `getAnthropicApiKeyWithSource`。同步返回——未就绪时 key 可为 None。
-pub fn get_anthropic_api_key_with_source(
-    opts: GetApiKeyOpts,
-) -> (Option<String>, ApiKeySource) {
+/// TS `getAnthropicApiKeyWithSource`。同步返回——缓存未就绪时 key 为 None
+/// 但 source 正确（apiKeyHelper 冷缓存语义，调用方应先 await 异步预热）。
+pub fn get_anthropic_api_key_with_source(opts: GetApiKeyOpts) -> (Option<String>, ApiKeySource) {
     // --bare：密闭认证。只认 env API key 和 --settings 的 apiKeyHelper。
     if is_bare_mode() {
         if let Some(key) = env("ANTHROPIC_API_KEY") {
@@ -1232,11 +1210,8 @@ pub fn get_anthropic_api_key_with_source(
             && env("CLAUDE_CODE_OAUTH_TOKEN").is_none()
             && env("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR").is_none()
         {
-            // 对齐 TS throw：调用方按需转成 ClaudeError。
-            return (
-                None,
-                ApiKeySource::None, /* 错误经 [get_anthropic_api_key_or_error] 抛出 */
-            );
+            // 对齐 TS 的 throw：详见 [get_anthropic_api_key_or_error]。
+            return (None, ApiKeySource::None);
         }
         if let Some(key) = api_key_env {
             return (Some(key), ApiKeySource::AnthropicApiKey);
@@ -1259,7 +1234,7 @@ pub fn get_anthropic_api_key_with_source(
     }
 
     // apiKeyHelper：同步缓存读，永不阻塞；缓存冷时返回 key=null 但 source 正确。
-    if let Some(_helper) = get_configured_api_key_helper() {
+    if get_configured_api_key_helper().is_some() {
         return (
             if opts.skip_retrieving_key_from_api_key_helper {
                 None
@@ -1278,14 +1253,14 @@ pub fn get_anthropic_api_key_with_source(
     (None, ApiKeySource::None)
 }
 
-/// CI 模式下 TS 抛错的 Rust 入口。
+/// CI 模式下 TS 抛错的 Rust 入口（对齐 TS `throw new Error`）。
 pub fn get_anthropic_api_key_or_error() -> AuthResult<Option<String>> {
     let (key, source) = get_anthropic_api_key_with_source(GetApiKeyOpts::default());
     if key.is_none() && source == ApiKeySource::None {
-        // 仅在 CI 缺凭据时对齐 TS 的 throw。
-        if (is_env_truthy(env("CI").as_deref()) || env("NODE_ENV").as_deref() == Some("test"))
+        if (is_env_truthy(env("CI").as_deref())
+            || env("NODE_ENV").as_deref() == Some("test"))
+            && !is_bare_mode()
             && env("ANTHROPIC_API_KEY").is_none()
-            && (!is_bare_mode())
             && get_api_key_from_file_descriptor().is_none()
             && env("CLAUDE_CODE_OAUTH_TOKEN").is_none()
             && env("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR").is_none()
@@ -1311,8 +1286,8 @@ fn is_api_key_helper_from_project_or_local_settings() -> bool {
     };
     let project = get_settings_for_source(SettingSource::ProjectSettings);
     let local = get_settings_for_source(SettingSource::LocalSettings);
-    project.and_then(|s| s.api_key_helper).as_deref() == Some(&helper)
-        || local.and_then(|s| s.api_key_helper).as_deref() == Some(&helper)
+    project.and_then(|s| s.api_key_helper).as_deref() == Some(helper.as_str())
+        || local.and_then(|s| s.api_key_helper).as_deref() == Some(helper.as_str())
 }
 
 /// TS `calculateApiKeyHelperTTL`。
@@ -1348,14 +1323,14 @@ pub fn normalize_api_key_for_config(api_key: &str) -> String {
 struct ApiKeyHelperCacheEntry {
     value: Option<String>,
     timestamp: i64,
-    cold: bool,
 }
 
 static API_KEY_HELPER_CACHE: Mutex<Option<ApiKeyHelperCacheEntry>> = Mutex::new(None);
-/// 冷启动执行开始时间（非空表示用户在等）。
+/// 冷启动执行开始时间（非 0 表示用户在等）。
 static API_KEY_HELPER_INFLIGHT_STARTED_AT: Mutex<Option<i64>> = Mutex::new(None);
 static API_KEY_HELPER_EPOCH: AtomicU64 = AtomicU64::new(0);
-static API_KEY_HELPER_INFLIGHT: Mutex<Option<(watch::Sender<Option<AuthResult<Option<String>>>>, u64)>> =
+/// in-flight 执行的 watch 广播器（冷缓存并发去重）。
+static API_KEY_HELPER_INFLIGHT: Mutex<Option<watch::Sender<Option<AuthResult<Option<String>>>>>> =
     Mutex::new(None);
 
 /// TS `getApiKeyHelperElapsedMs`。
@@ -1405,7 +1380,7 @@ pub async fn get_api_key_from_api_key_helper(is_non_interactive: bool) -> AuthRe
         if need_spawn {
             let (tx, _) = watch::channel(None);
             *lock(&API_KEY_HELPER_INFLIGHT_STARTED_AT) = None;
-            *lock(&API_KEY_HELPER_INFLIGHT) = Some((tx.clone(), epoch));
+            *lock(&API_KEY_HELPER_INFLIGHT) = Some(tx.clone());
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     let _ = run_and_cache(is_non_interactive, false, epoch, Some(tx)).await;
@@ -1415,87 +1390,81 @@ pub async fn get_api_key_from_api_key_helper(is_non_interactive: bool) -> AuthRe
         return Ok(entry.value);
     }
     // 冷缓存：并发去重。
-    if let Some((tx, _epoch)) = lock(&API_KEY_HELPER_INFLIGHT).clone() {
+    if let Some(tx) = lock(&API_KEY_HELPER_INFLIGHT).as_ref().cloned() {
         let mut rx = tx.subscribe();
-        drop(tx);
         loop {
-            if rx.borrow().is_some() {
-                if let Some(result) = &*rx.borrow() {
-                    return match result {
-                        Ok(v) => Ok(v.clone()),
-                        Err(e) => Err(e.clone()),
-                    };
-                }
+            if let Some(result) = &*rx.borrow() {
+                return match result {
+                    Ok(v) => Ok(v.clone()),
+                    Err(e) => Err(e.clone()),
+                };
             }
             if rx.changed().await.is_err() {
-                return Ok(None);
+                // 广播器已 Drop 且未发结果：回退到同步读。
+                return Ok(get_api_key_from_api_key_helper_cached());
             }
         }
     }
     let epoch = API_KEY_HELPER_EPOCH.load(Ordering::SeqCst);
     let (tx, _) = watch::channel(None);
-    *lock(&API_KEY_HELPER_INFLIGHT) = Some((tx.clone(), epoch));
+    *lock(&API_KEY_HELPER_INFLIGHT) = Some(tx.clone());
     *lock(&API_KEY_HELPER_INFLIGHT_STARTED_AT) = Some(now_ms());
-    drop(tx);
-    let result = run_and_cache(is_non_interactive, true, epoch, None).await;
-    *lock(&API_KEY_HELPER_INFLIGHT_STARTED_AT) = None;
-    if let Some((current, current_epoch)) = lock(&API_KEY_HELPER_INFLIGHT).clone() {
-        if current_epoch == epoch {
-            let _ = current.send(Some(result.clone()));
-            *lock(&API_KEY_HELPER_INFLIGHT) = None;
-        }
-    }
-    result
+    run_and_cache(is_non_interactive, true, epoch, Some(tx)).await
 }
 
 /// TS `_runAndCache`：epoch 匹配才写缓存；失败时 SWR 保命、冷缓存写 ' ' 哨兵。
+/// `finally` 语义（摘除 in-flight）在任何分支上都执行。
 async fn run_and_cache(
     is_non_interactive: bool,
     is_cold: bool,
     epoch: u64,
     tx: Option<watch::Sender<Option<AuthResult<Option<String>>>>>,
 ) -> AuthResult<Option<String>> {
-    let result = match execute_api_key_helper(is_non_interactive).await {
-        Ok(Some(value)) => {
-            if epoch == API_KEY_HELPER_EPOCH.load(Ordering::SeqCst) {
-                *lock(&API_KEY_HELPER_CACHE) = Some(ApiKeyHelperCacheEntry {
-                    value: Some(value.clone()),
-                    timestamp: now_ms(),
-                    cold: is_cold,
-                });
+    // 内层 async 块允许任意提前返回，外层统一收口（finally 对齐）。
+    let result = async {
+        match execute_api_key_helper(is_non_interactive).await {
+            Ok(Some(value)) => {
+                if epoch == API_KEY_HELPER_EPOCH.load(Ordering::SeqCst) {
+                    *lock(&API_KEY_HELPER_CACHE) = Some(ApiKeyHelperCacheEntry {
+                        value: Some(value.clone()),
+                        timestamp: now_ms(),
+                    });
+                }
+                Ok(Some(value))
             }
-            Ok(Some(value))
-        }
-        Ok(None) => Ok(None),
-        Err(err) => {
-            let detail = error_message(&err);
-            eprintln!("apiKeyHelper failed: {detail}");
-            log_for_debugging(
-                &format!("Error getting API key from apiKeyHelper: {detail}"),
-                DebugLogLevel::Error,
-            );
-            // SWR：瞬时失败不该用 ' ' 哨兵顶掉还能用的旧值。
-            if !is_cold {
-                if let Some(entry) = lock(&API_KEY_HELPER_CACHE).as_ref() {
-                    if entry.value.as_deref() != Some(" ") {
-                        let _ = tx.as_ref().map(|t| {
-                            t.send(Some(Err(err.clone())))
-                        });
-                        return Ok(entry.value.clone());
+            Ok(None) => Ok(None),
+            Err(err) => {
+                let detail = error_message(&err);
+                eprintln!("apiKeyHelper failed: {detail}");
+                log_for_debugging(
+                    &format!("Error getting API key from apiKeyHelper: {detail}"),
+                    DebugLogLevel::Error,
+                );
+                // SWR：瞬时失败不该用 ' ' 哨兵顶掉还能用的旧值。
+                if !is_cold {
+                    if let Some(entry) = lock(&API_KEY_HELPER_CACHE).as_ref() {
+                        if entry.value.as_deref() != Some(" ") {
+                            return Ok(entry.value.clone());
+                        }
                     }
                 }
+                // 冷缓存或此前已失败：缓存 ' ' 哨兵，阻止调用方回退到 OAuth。
+                if epoch == API_KEY_HELPER_EPOCH.load(Ordering::SeqCst) {
+                    *lock(&API_KEY_HELPER_CACHE) = Some(ApiKeyHelperCacheEntry {
+                        value: Some(" ".to_string()),
+                        timestamp: now_ms(),
+                    });
+                }
+                Ok(Some(" ".to_string()))
             }
-            // 冷缓存或此前已失败：缓存 ' ' 哨兵，阻止调用方回退到 OAuth。
-            if epoch == API_KEY_HELPER_EPOCH.load(Ordering::SeqCst) {
-                *lock(&API_KEY_HELPER_CACHE) = Some(ApiKeyHelperCacheEntry {
-                    value: Some(" ".to_string()),
-                    timestamp: now_ms(),
-                    cold: is_cold,
-                });
-            }
-            Ok(Some(" ".to_string()))
         }
-    };
+    }
+    .await;
+    // finally：epoch 未变则摘除 in-flight（对齐 TS 的 finally 语义）。
+    if epoch == API_KEY_HELPER_EPOCH.load(Ordering::SeqCst) {
+        *lock(&API_KEY_HELPER_INFLIGHT_STARTED_AT) = None;
+        *lock(&API_KEY_HELPER_INFLIGHT) = None;
+    }
     if let Some(tx) = tx {
         let _ = tx.send(Some(result.clone()));
     }
@@ -1560,10 +1529,6 @@ pub fn prefetch_api_key_from_api_key_helper_if_safe(is_non_interactive: bool) {
     {
         return;
     }
-    spawn_get_api_key_from_helper(is_non_interactive);
-}
-
-fn spawn_get_api_key_from_helper(is_non_interactive: bool) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
             let _ = get_api_key_from_api_key_helper(is_non_interactive).await;
@@ -1616,7 +1581,7 @@ fn compute_api_key_from_config_or_macos_keychain() -> Option<(String, ApiKeySour
 }
 
 fn is_valid_api_key(api_key: &str) -> bool {
-    // 仅允许字母数字、中划线、下划线。
+    // 仅允许字母数字、中划线、下划线（对齐 TS 正则 ^[a-zA-Z0-9-_]+$）。
     !api_key.is_empty()
         && api_key
             .chars()
@@ -1649,18 +1614,14 @@ pub async fn save_api_key(api_key: &str) -> AuthResult<()> {
     let keychain_ok = saved_to_keychain;
     save_global_config(&move |current| {
         let mut updated = current.clone();
-        let approved = config_approved_api_keys(current);
-        let mut new_approved = approved;
+        let mut new_approved = config_approved_api_keys(current);
         if !new_approved.contains(&normalized_key) {
             new_approved.push(normalized_key.clone());
         }
-        // keychain 存成功则不清 config 中的旧值（对齐 TS 的 `current.primaryApiKey`）。
+        // keychain 存成功则不动 config 中的旧值（对齐 TS 的 `current.primaryApiKey`）。
         if !keychain_ok {
             if let Some(obj) = updated.as_object_mut() {
-                obj.insert(
-                    "primaryApiKey".to_string(),
-                    Value::String(api_key.to_string()),
-                );
+                obj.insert("primaryApiKey".to_string(), Value::String(api_key.to_string()));
             }
         }
         if let Some(obj) = updated.as_object_mut() {
@@ -1718,8 +1679,8 @@ pub fn is_aws_auth_refresh_from_project_settings() -> bool {
     };
     let project = get_settings_for_source(SettingSource::ProjectSettings);
     let local = get_settings_for_source(SettingSource::LocalSettings);
-    project.and_then(|s| s.aws_auth_refresh).as_deref() == Some(&value)
-        || local.and_then(|s| s.aws_auth_refresh).as_deref() == Some(&value)
+    project.and_then(|s| s.aws_auth_refresh).as_deref() == Some(value.as_str())
+        || local.and_then(|s| s.aws_auth_refresh).as_deref() == Some(value.as_str())
 }
 
 /// TS `getConfiguredAwsCredentialExport`。
@@ -1734,8 +1695,8 @@ pub fn is_aws_credential_export_from_project_settings() -> bool {
     };
     let project = get_settings_for_source(SettingSource::ProjectSettings);
     let local = get_settings_for_source(SettingSource::LocalSettings);
-    project.and_then(|s| s.aws_credential_export).as_deref() == Some(&value)
-        || local.and_then(|s| s.aws_credential_export).as_deref() == Some(&value)
+    project.and_then(|s| s.aws_credential_export).as_deref() == Some(value.as_str())
+        || local.and_then(|s| s.aws_credential_export).as_deref() == Some(value.as_str())
 }
 
 /// TS `getConfiguredGcpAuthRefresh`。
@@ -1750,8 +1711,8 @@ pub fn is_gcp_auth_refresh_from_project_settings() -> bool {
     };
     let project = get_settings_for_source(SettingSource::ProjectSettings);
     let local = get_settings_for_source(SettingSource::LocalSettings);
-    project.and_then(|s| s.gcp_auth_refresh).as_deref() == Some(&value)
-        || local.and_then(|s| s.gcp_auth_refresh).as_deref() == Some(&value)
+    project.and_then(|s| s.gcp_auth_refresh).as_deref() == Some(value.as_str())
+        || local.and_then(|s| s.gcp_auth_refresh).as_deref() == Some(value.as_str())
 }
 
 /// provider 刷新命令的通用执行（streaming 简化为收尾后批量喂状态管理器）。
@@ -1847,11 +1808,10 @@ async fn run_aws_auth_refresh() -> AuthResult<bool> {
     }
 }
 
-/// `isValidAwsStsOutput`：Credentials 三字段均为非空字符串。
+/// TS `isValidAwsStsOutput`：Credentials 三字段均为非空字符串。
 fn is_valid_aws_sts_output(value: &Value) -> bool {
-    let credentials = match value.get("Credentials") {
-        Some(c) => c,
-        None => return false,
+    let Some(credentials) = value.get("Credentials") else {
+        return false;
     };
     ["AccessKeyId", "SecretAccessKey", "SessionToken"].iter().all(|field| {
         credentials
@@ -1902,33 +1862,50 @@ async fn get_aws_creds_from_credential_export() -> AuthResult<Option<AwsCredenti
     if !is_valid_aws_sts_output(&parsed) {
         return Err(AuthError::InvalidAwsStsOutput);
     }
-    log_for_debugging("AWS credentials retrieved from awsCredentialExport", DebugLogLevel::Debug);
+    log_for_debugging(
+        "AWS credentials retrieved from awsCredentialExport",
+        DebugLogLevel::Debug,
+    );
+    let credentials = &parsed["Credentials"];
     Ok(Some(AwsCredentials {
-        access_key_id: parsed["Credentials"]["AccessKeyId"].as_str().unwrap_or("").to_string(),
-        secret_access_key: parsed["Credentials"]["SecretAccessKey"].as_str().unwrap_or("").to_string(),
-        session_token: parsed["Credentials"]["SessionToken"].as_str().unwrap_or("").to_string(),
+        access_key_id: credentials["AccessKeyId"].as_str().unwrap_or("").to_string(),
+        secret_access_key: credentials["SecretAccessKey"].as_str().unwrap_or("").to_string(),
+        session_token: credentials["SessionToken"].as_str().unwrap_or("").to_string(),
     }))
 }
 
-static AWS_CREDS_MEMO: OnceLock<
-    Arc<TtlMemoizedAsync<(), Option<AwsCredentials>, PinFuture>>,
-> = OnceLock::new();
+/// `memoize_with_ttl_async` 的 boxed-future 类型别名。
+type BoxCredsFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<Option<AwsCredentials>, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send,
+    >,
+>;
+type BoxBoolFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send,
+    >,
+>;
 
-type PinFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<AwsCredentials>, Box<dyn std::error::Error + Send + Sync>>> + Send>>;
+static AWS_CREDS_MEMO: OnceLock<Arc<TtlMemoizedAsync<(), Option<AwsCredentials>, BoxCredsFuture>>> =
+    OnceLock::new();
 
 /// TS `refreshAndGetAwsCredentials`（memoizeWithTTLAsync，1h TTL）。
 pub async fn refresh_and_get_aws_credentials() -> AuthResult<Option<AwsCredentials>> {
     let memo = AWS_CREDS_MEMO
         .get_or_init(|| {
             memoize_with_ttl_async(
-                |_: &()| Box::pin(aws_creds_body()) as PinFuture,
+                |_: &()| Box::pin(aws_creds_body()) as BoxCredsFuture,
                 DEFAULT_AWS_STS_TTL_MS,
             )
         })
         .clone();
     memo.call(&())
         .await
-        .map_err(|e| AuthError::Io(error_message(e.as_ref())))
+        .map_err(|e| AuthError::Io(error_message(&*e)))
 }
 
 async fn aws_creds_body() -> Result<Option<AwsCredentials>, Box<dyn std::error::Error + Send + Sync>> {
@@ -1991,22 +1968,21 @@ async fn run_gcp_auth_refresh() -> AuthResult<bool> {
     refresh_gcp_auth(&gcp_auth_refresh).await
 }
 
-static GCP_CREDS_MEMO: OnceLock<Arc<TtlMemoizedAsync<(), bool, PinBoolFuture>>> = OnceLock::new();
-type PinBoolFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> + Send>>;
+static GCP_CREDS_MEMO: OnceLock<Arc<TtlMemoizedAsync<(), bool, BoxBoolFuture>>> = OnceLock::new();
 
 /// TS `refreshGcpCredentialsIfNeeded`（memoizeWithTTLAsync，1h TTL）。
 pub async fn refresh_gcp_credentials_if_needed() -> AuthResult<bool> {
     let memo = GCP_CREDS_MEMO
         .get_or_init(|| {
             memoize_with_ttl_async(
-                |_: &()| Box::pin(gcp_creds_body()) as PinBoolFuture,
+                |_: &()| Box::pin(gcp_creds_body()) as BoxBoolFuture,
                 DEFAULT_GCP_CREDENTIAL_TTL_MS,
             )
         })
         .clone();
     memo.call(&())
         .await
-        .map_err(|e| AuthError::Io(error_message(e.as_ref())))
+        .map_err(|e| AuthError::Io(error_message(&*e)))
 }
 
 async fn gcp_creds_body() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -2110,15 +2086,13 @@ static PENDING_401: Mutex<HashMap<String, watch::Sender<Option<AuthResult<bool>>
     Mutex::new(HashMap::new());
 
 /// TS `handleOAuth401Error`：服务端说过期就强制刷新（本地判定分歧时也照做）。
-/// 同 token 的并发调用去重为一次 keychain 读 + 刷新。
+/// 同 token 的并发调用去重为一次存储读 + 刷新。
 pub async fn handle_oauth_401_error(failed_access_token: &str) -> AuthResult<bool> {
+    if let Some(tx) = lock(&PENDING_401)
+        .get(failed_access_token)
+        .cloned()
     {
-        let map = lock(&PENDING_401);
-        if let Some(tx) = map.get(failed_access_token) {
-            let tx = tx.clone();
-            drop(map);
-            return wait_for_result(&tx).await;
-        }
+        return wait_for_result(&tx).await;
     }
     let (tx, _) = watch::channel(None);
     lock(&PENDING_401).insert(failed_access_token.to_string(), tx.clone());
@@ -2131,15 +2105,14 @@ pub async fn handle_oauth_401_error(failed_access_token: &str) -> AuthResult<boo
 async fn wait_for_result(tx: &watch::Sender<Option<AuthResult<bool>>>) -> AuthResult<bool> {
     let mut rx = tx.subscribe();
     loop {
-        if rx.borrow().is_some() {
-            if let Some(result) = &*rx.borrow() {
-                return match result {
-                    Ok(v) => Ok(*v),
-                    Err(e) => Err(e.clone()),
-                };
-            }
+        if let Some(result) = &*rx.borrow() {
+            return match result {
+                Ok(v) => Ok(*v),
+                Err(e) => Err(e.clone()),
+            };
         }
         if rx.changed().await.is_err() {
+            // 广播器已 Drop 且未发结果：保守返回 false。
             return Ok(false);
         }
     }
@@ -2155,7 +2128,7 @@ async fn handle_oauth_401_error_impl(failed_access_token: &str) -> AuthResult<bo
     if current_tokens.refresh_token.is_none() {
         return Ok(false);
     }
-    // keychain 里 token 不同 → 另一个 tab 已刷新，直接用。
+    // 存储里 token 不同 → 另一个 tab 已刷新，直接用。
     if current_tokens.access_token != failed_access_token {
         log_event("tengu_oauth_401_recovered_from_keychain");
         return Ok(true);
@@ -2165,8 +2138,8 @@ async fn handle_oauth_401_error_impl(failed_access_token: &str) -> AuthResult<bo
 }
 
 /// 并发刷新去重槽。
-static PENDING_REFRESH_CHECK: Mutex<Option<(watch::Sender<Option<AuthResult<bool>>>, u64)>> =
-   Mutex::new(None);
+static PENDING_REFRESH_CHECK: Mutex<Option<watch::Sender<Option<AuthResult<bool>>>>> =
+    Mutex::new(None);
 
 /// TS `checkAndRefreshOAuthTokenIfNeeded`。retry_count=0 且 !force 时并发去重。
 pub async fn check_and_refresh_oauth_token_if_needed(
@@ -2174,18 +2147,13 @@ pub async fn check_and_refresh_oauth_token_if_needed(
     force: bool,
 ) -> AuthResult<bool> {
     if retry_count == 0 && !force {
-        if let Some((tx, _)) = lock(&PENDING_REFRESH_CHECK).clone() {
-            drop(tx);
-            // 复用进行中的调用（不含本次）。
-            if let Some((tx, _)) = lock(&PENDING_REFRESH_CHECK).clone() {
-                return wait_for_result(&tx).await;
-            }
+        if let Some(tx) = lock(&PENDING_REFRESH_CHECK).as_ref().cloned() {
+            return wait_for_result(&tx).await;
         }
-        let epoch = API_KEY_HELPER_EPOCH.load(Ordering::SeqCst);
         let (tx, _) = watch::channel(None);
-        *lock(&PENDING_REFRESH_CHECK) = Some((tx.clone(), epoch));
+        *lock(&PENDING_REFRESH_CHECK) = Some(tx.clone());
         let result = check_and_refresh_oauth_token_if_needed_impl(retry_count, force).await;
-        if let Some((current, _)) = lock(&PENDING_REFRESH_CHECK).clone() {
+        if let Some(current) = lock(&PENDING_REFRESH_CHECK).as_ref().cloned() {
             let _ = current.send(Some(result.clone()));
         }
         *lock(&PENDING_REFRESH_CHECK) = None;
@@ -2205,11 +2173,13 @@ async fn check_and_refresh_oauth_token_if_needed_impl(
     if !force && !still_expired(&tokens) {
         return Ok(false);
     }
-    let refresh_token = match tokens.and_then(|t| t.refresh_token) {
-        Some(token) => token,
+    let (refresh_token, scopes) = match tokens {
+        Some(t) => match t.refresh_token {
+            Some(rt) => (rt, t.scopes),
+            None => return Ok(false),
+        },
         None => return Ok(false),
     };
-    let scopes = tokens.map(|t| t.scopes).unwrap_or_default();
     if !should_use_claude_ai_auth(&scopes) {
         return Ok(false);
     }
@@ -2271,7 +2241,7 @@ async fn check_and_refresh_oauth_token_if_needed_impl(
             Ok(true)
         }
         Err(err) => {
-            log_error(err.clone());
+            log_error(err);
             clear_oauth_token_cache();
             let current_tokens = get_claude_ai_oauth_tokens_async().await?;
             if let Some(current) = current_tokens {
@@ -2456,8 +2426,8 @@ pub fn is_otel_headers_helper_from_project_or_local_settings() -> bool {
     };
     let project = get_settings_for_source(SettingSource::ProjectSettings);
     let local = get_settings_for_source(SettingSource::LocalSettings);
-    project.and_then(|s| s.otel_headers_helper).as_deref() == Some(&helper)
-        || local.and_then(|s| s.otel_headers_helper).as_deref() == Some(&helper)
+    project.and_then(|s| s.otel_headers_helper).as_deref() == Some(helper.as_str())
+        || local.and_then(|s| s.otel_headers_helper).as_deref() == Some(helper.as_str())
 }
 
 static CACHED_OTEL_HEADERS: Mutex<Option<(Vec<(String, String)>, i64)>> = Mutex::new(None);
@@ -2526,7 +2496,6 @@ pub fn get_otel_headers_from_helper() -> AuthResult<Vec<(String, String)>> {
 
 /// TS `getAccountInformation`。
 pub fn get_account_information() -> Option<UserAccountInfo> {
-    use crate::utils::model::provider_classification::ApiProvider;
     if get_api_provider(&get_initial_settings()) != ApiProvider::FirstParty {
         return None;
     }
@@ -2549,25 +2518,39 @@ pub fn get_account_information() -> Option<UserAccountInfo> {
         account_info.api_key_source = Some(api_key_source);
     }
     let oauth_account = get_oauth_account_info();
+    let managed_credentials = auth_token_source == AuthTokenSource::ClaudeAi
+        || api_key_source == ApiKeySource::LoginManagedKey;
     // 外部 key/token 场景下组织不可知。
-    if auth_token_source == AuthTokenSource::ClaudeAi
-        || api_key_source == ApiKeySource::LoginManagedKey
-    {
+    if managed_credentials {
         if let Some(org_name) = oauth_account.as_ref().and_then(|a| a.organization_name.clone()) {
             account_info.organization = Some(org_name);
         }
     }
-    if (auth_token_source == AuthTokenSource::ClaudeAi
-        || api_key_source == ApiKeySource::LoginManagedKey)
-        && let Some(email) = oauth_account.as_ref().and_then(|a| a.email_address.clone())
-    {
-        account_info.email = Some(email);
+    if managed_credentials {
+        if let Some(email) = oauth_account.as_ref().and_then(|a| a.email_address.clone()) {
+            account_info.email = Some(email);
+        }
     }
     Some(account_info)
 }
 
+/// profile 端点响应的 duck-type 最小结构。
+#[derive(Debug, Clone)]
+pub struct OauthProfile {
+    pub organization_uuid: String,
+}
+
+/// TS `getOauthProfileFromOauthToken`：需要 HTTP 客户端。
+/// **TODO(reqwest)**：GET `${base_api_url}/api/oauth/profile`（Bearer token，
+/// 错误吞掉返回 None，见 TS getOauthProfile.ts）。
+pub async fn get_oauth_profile_from_oauth_token(
+    _access_token: &str,
+) -> AuthResult<Option<OauthProfile>> {
+    Err(AuthError::HttpClientUnavailable("get_oauth_profile_from_oauth_token"))
+}
+
 /// TS `validateForceLoginOrg`：fail closed——拿不到 org 信息就判失败。
-/// profile 端点需要 HTTP 客户端，拉取部分占位。
+/// profile 端点拉取需要 HTTP 客户端，未就绪前返回 Err。
 pub async fn validate_force_login_org() -> AuthResult<OrgValidationResult> {
     // claude ssh 远端：真实认证在本地由代理注入，占位 token 无法验。
     if env("ANTHROPIC_UNIX_SOCKET").is_some() {
@@ -2640,21 +2623,6 @@ pub async fn validate_force_login_org() -> AuthResult<OrgValidationResult> {
     })
 }
 
-/// profile 端点响应的 duck-type 最小结构。
-#[derive(Debug, Clone)]
-pub struct OauthProfile {
-    pub organization_uuid: String,
-}
-
-/// TS `getOauthProfileFromOauthToken`：需要 HTTP 客户端。
-/// **TODO(reqwest)**：GET `${base_api_url}/api/oauth/profile`（Bearer token，
-/// 403/404 等错误吞掉返回 None，见 TS getOauthProfile.ts）。
-pub async fn get_oauth_profile_from_oauth_token(
-    _access_token: &str,
-) -> AuthResult<Option<OauthProfile>> {
-    Err(AuthError::HttpClientUnavailable("get_oauth_profile_from_oauth_token"))
-}
-
 // ---------------------------------------------------------------------------
 // 单元测试
 // ---------------------------------------------------------------------------
@@ -2668,15 +2636,12 @@ mod tests {
     }
 
     #[test]
-    fn inference_only_token_has_inference_scope() {
+    fn inference_only_token_shape() {
         let tokens = inference_tokens();
         assert!(should_use_claude_ai_auth(&tokens.scopes));
-        assert!(!has_profile_scope_from(&tokens));
+        assert!(!tokens.scopes.iter().any(|s| s == CLAUDE_AI_PROFILE_SCOPE));
         assert!(tokens.refresh_token.is_none());
-    }
-
-    fn has_profile_scope_from(tokens: &OAuthTokens) -> bool {
-        tokens.scopes.iter().any(|s| s == CLAUDE_AI_PROFILE_SCOPE)
+        assert!(tokens.expires_at.is_none());
     }
 
     #[test]
@@ -2731,37 +2696,32 @@ mod tests {
     }
 
     #[test]
-    fn subscription_name_and_access() {
-        // free → 非 consumer plan
+    fn consumer_plan_classification() {
         assert!(!is_consumer_plan(&SubscriptionType::Free));
         assert!(is_consumer_plan(&SubscriptionType::Max));
         assert!(is_consumer_plan(&SubscriptionType::Pro));
         assert!(!is_consumer_plan(&SubscriptionType::Team));
+        assert!(!is_consumer_plan(&SubscriptionType::Enterprise));
     }
 
     #[test]
-    fn ttl_parsing_and_default() {
-        assert_eq!(calculate_api_key_helper_ttl(), DEFAULT_API_KEY_HELPER_TTL_MS);
+    fn ttl_default_when_unset() {
+        // 仅当未设置环境变量时断言默认值，避免与 CI 环境冲突。
+        if std::env::var("CLAUDE_CODE_API_KEY_HELPER_TTL_MS").is_err() {
+            assert_eq!(calculate_api_key_helper_ttl(), DEFAULT_API_KEY_HELPER_TTL_MS);
+        }
     }
 
     #[test]
-    fn save_status_defaults() {
-        let s = SaveStatus { success: true, warning: None };
-        assert!(s.success);
-        assert_eq!(s.warning, None);
-    }
-
-    #[test]
-    fn oauth_profile_source_error_is_clone() {
-        // watch channel 广播需要 Clone + Send。
+    fn error_is_clone_for_broadcast() {
+        // watch channel 广播需要 Clone。
         let e = AuthError::HttpClientUnavailable("test");
-        let cloned = e.clone();
-        assert_eq!(e, cloned);
+        assert_eq!(e, e.clone());
         assert!(e.to_string().contains("reqwest"));
     }
 
     #[test]
-    fn inference_only_tokens_roundtrip_json() {
+    fn oauth_tokens_roundtrip_json() {
         let tokens = inference_tokens();
         let json = serde_json::to_string(&tokens).unwrap();
         let back: OAuthTokens = serde_json::from_str(&json).unwrap();
@@ -2784,7 +2744,7 @@ mod tests {
 
     #[test]
     fn mock_subscription_guard_non_ant() {
-        // 默认非 ant（除非 USER_TYPE=ant 的 CI），setter 为 no-op。
+        // 默认非 ant（CI 不设 USER_TYPE=ant），setter 为 no-op。
         set_mock_subscription(true, Some(SubscriptionType::Max));
         if !is_ant_user() {
             assert!(!should_use_mock_subscription());
