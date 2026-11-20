@@ -9,7 +9,7 @@
 //!   占位，待 messages 模块落地后替换。
 //!
 //! 判别联合使用 serde 内部标签（`behavior` / `type`），变体承载结构体中
-']* 不再重复判别字段（与 TS 平铺结构 wire 兼容）。
+//! 不再重复判别字段（与 TS 平铺结构 wire 兼容）。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
