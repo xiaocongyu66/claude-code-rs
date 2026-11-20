@@ -60,13 +60,13 @@ pub fn get_setting_source_name(source: SettingSource) -> &'static str {
 /// 额外接受 `'plugin'` / `'built-in'`。
 pub fn get_source_display_name(source: &str) -> String {
     match source {
-        "userSettings" => "User",
-        "projectSettings" => "Project",
-        "localSettings" => "Local",
-        "flagSettings" => "Flag",
-        "policySettings" => "Managed",
-        "plugin" => "Plugin",
-        "built-in" => "Built-in",
+        "userSettings" => "User".to_string(),
+        "projectSettings" => "Project".to_string(),
+        "localSettings" => "Local".to_string(),
+        "flagSettings" => "Flag".to_string(),
+        "policySettings" => "Managed".to_string(),
+        "plugin" => "Plugin".to_string(),
+        "built-in" => "Built-in".to_string(),
         _ => source.to_string(),
     }
 }
@@ -74,14 +74,14 @@ pub fn get_source_display_name(source: &str) -> String {
 /// 来源显示名（小写、内联使用）。额外接受 `'cliArg' | 'command' | 'session'`。
 pub fn get_setting_source_display_name_lowercase(source: &str) -> String {
     match source {
-        "userSettings" => "user settings",
-        "projectSettings" => "shared project settings",
-        "localSettings" => "project local settings",
-        "flagSettings" => "command line arguments",
-        "policySettings" => "enterprise managed settings",
-        "cliArg" => "CLI argument",
-        "command" => "command configuration",
-        "session" => "current session",
+        "userSettings" => "user settings".to_string(),
+        "projectSettings" => "shared project settings".to_string(),
+        "localSettings" => "project local settings".to_string(),
+        "flagSettings" => "command line arguments".to_string(),
+        "policySettings" => "enterprise managed settings".to_string(),
+        "cliArg" => "CLI argument".to_string(),
+        "command" => "command configuration".to_string(),
+        "session" => "current session".to_string(),
         _ => source.to_string(),
     }
 }
@@ -89,14 +89,14 @@ pub fn get_setting_source_display_name_lowercase(source: &str) -> String {
 /// 来源显示名（首字母大写、UI 标签使用）。
 pub fn get_setting_source_display_name_capitalized(source: &str) -> String {
     match source {
-        "userSettings" => "User settings",
-        "projectSettings" => "Shared project settings",
-        "localSettings" => "Project local settings",
-        "flagSettings" => "Command line arguments",
-        "policySettings" => "Enterprise managed settings",
-        "cliArg" => "CLI argument",
-        "command" => "Command configuration",
-        "session" => "Current session",
+        "userSettings" => "User settings".to_string(),
+        "projectSettings" => "Shared project settings".to_string(),
+        "localSettings" => "Project local settings".to_string(),
+        "flagSettings" => "Command line arguments".to_string(),
+        "policySettings" => "Enterprise managed settings".to_string(),
+        "cliArg" => "CLI argument".to_string(),
+        "command" => "Command configuration".to_string(),
+        "session" => "Current session".to_string(),
         _ => source.to_string(),
     }
 }

@@ -291,7 +291,7 @@ pub fn validate_permission_rule(rule: &str, behavior: Option<&str>) -> Permissio
                 format!("mcp__{}__*", mcp_info.server_name),
             ];
             if let Some(tool) = mcp_info.tool_name.as_deref() {
-                if tool != '*' {
+                if tool != "*" {
                     examples.push(format!("mcp__{}__{}", mcp_info.server_name, tool));
                 }
             }
@@ -451,26 +451,26 @@ pub fn validate_permission_rule(rule: &str, behavior: Option<&str>) -> Permissio
 
     // F3 fix (Codex round 6): apply the same `<key>@<host>` enforcement on
     // the deny path.
-    if parsed.tool_name == "VaultHttpFetch"
-        && behavior == Some("deny")
-        && let Some(rc) = parsed.rule_content.as_deref()
-        && !VAULT_KEY_HOST_RE.is_match(rc)
-    {
-        return PermissionRuleValidation {
-            valid: false,
-            error: Some(
-                "VaultHttpFetch deny rule content must be '<key>@<host>' or '<key>@*' (or whole-tool deny without parentheses for kill switch)".to_string(),
-            ),
-            suggestion: Some(format!(
-                "Found '{}'. Use 'VaultHttpFetch' (no parens) for kill switch, or 'VaultHttpFetch({}@*)' for any-host.",
-                rc, rc
-            )),
-            examples: Some(vec![
-                "VaultHttpFetch — whole-tool kill switch".to_string(),
-                format!("VaultHttpFetch({}@api.github.com)", rc),
-                format!("VaultHttpFetch({}@*)", rc),
-            ]),
-        };
+    if parsed.tool_name == "VaultHttpFetch" && behavior == Some("deny") {
+        if let Some(rc) = parsed.rule_content.as_deref() {
+            if !VAULT_KEY_HOST_RE.is_match(rc) {
+                return PermissionRuleValidation {
+                    valid: false,
+                    error: Some(
+                        "VaultHttpFetch deny rule content must be '<key>@<host>' or '<key>@*' (or whole-tool deny without parentheses for kill switch)".to_string(),
+                    ),
+                    suggestion: Some(format!(
+                        "Found '{}'. Use 'VaultHttpFetch' (no parens) for kill switch, or 'VaultHttpFetch({}@*)' for any-host.",
+                        rc, rc
+                    )),
+                    examples: Some(vec![
+                        "VaultHttpFetch — whole-tool kill switch".to_string(),
+                        format!("VaultHttpFetch({}@api.github.com)", rc),
+                        format!("VaultHttpFetch({}@*)", rc),
+                    ]),
+                };
+            }
+        }
     }
 
     // Behavior-aware checks for vault-class tools.
@@ -497,25 +497,26 @@ pub fn validate_permission_rule(rule: &str, behavior: Option<&str>) -> Permissio
         }
         // For VaultHttpFetch specifically, require the rule content to be
         // formatted as `<key>@<host>` (or `<key>@*`).
-        if parsed.tool_name == "VaultHttpFetch"
-            && let Some(rc) = parsed.rule_content.as_deref()
-            && !VAULT_KEY_HOST_RE.is_match(rc)
-        {
-            return PermissionRuleValidation {
-                valid: false,
-                error: Some(
-                    "VaultHttpFetch rule content must be '<key>@<host>' or '<key>@*'".to_string(),
-                ),
-                suggestion: Some(format!(
-                    "Found '{}'. Use e.g. 'github-token@api.github.com' or 'admin-key@127.0.0.1:8443' to bind a key to a host.",
-                    rc
-                )),
-                examples: Some(vec![
-                    "VaultHttpFetch(github-token@api.github.com)".to_string(),
-                    "VaultHttpFetch(local-admin@localhost:8443)".to_string(),
-                    "VaultHttpFetch(stripe-key@*) - any host (advanced)".to_string(),
-                ]),
-            };
+        if parsed.tool_name == "VaultHttpFetch" {
+            if let Some(rc) = parsed.rule_content.as_deref() {
+                if !VAULT_KEY_HOST_RE.is_match(rc) {
+                    return PermissionRuleValidation {
+                        valid: false,
+                        error: Some(
+                            "VaultHttpFetch rule content must be '<key>@<host>' or '<key>@*'".to_string(),
+                        ),
+                        suggestion: Some(format!(
+                            "Found '{}'. Use e.g. 'github-token@api.github.com' or 'admin-key@127.0.0.1:8443' to bind a key to a host.",
+                            rc
+                        )),
+                        examples: Some(vec![
+                            "VaultHttpFetch(github-token@api.github.com)".to_string(),
+                            "VaultHttpFetch(local-admin@localhost:8443)".to_string(),
+                            "VaultHttpFetch(stripe-key@*) - any host (advanced)".to_string(),
+                        ]),
+                    };
+                }
+            }
         }
     }
 
@@ -538,11 +539,11 @@ pub fn permission_rule_schema_validate(val: &str) -> Result<(), String> {
         message.push_str(". ");
         message.push_str(&suggestion);
     }
-    if let Some(examples) = result.examples
-        && !examples.is_empty()
-    {
-        message.push_str(". Examples: ");
-        message.push_str(&examples.join(", "));
+    if let Some(examples) = result.examples {
+        if !examples.is_empty() {
+            message.push_str(". Examples: ");
+            message.push_str(&examples.join(", "));
+        }
     }
     Err(message)
 }
@@ -571,9 +572,10 @@ mod tests {
         assert!(validate_permission_rule("mcp__server", None).valid);
         assert!(validate_permission_rule("mcp__server__tool", None).valid);
         assert!(validate_permission_rule("mcp__server__*", None).valid);
-        // Wildcard content normalizes to tool-level rule → valid
+        // MCP 规则不接受括号：parser 会把独立通配符 `(*)` 归一化掉，但原始
+        // 字符串含 `(` → 仍判非法（对齐 TS 的双重检查）
         let r = validate_permission_rule("mcp__server(*)", None);
-        assert!(r.valid, "{:?}", r);
+        assert!(!r.valid, "{:?}", r);
         let r = validate_permission_rule("mcp__server(foo)", None);
         assert!(!r.valid);
     }
