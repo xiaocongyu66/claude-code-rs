@@ -90,9 +90,9 @@ pub fn lock_sync(file: &Path, options: &LockOptions, wait: bool) -> io::Result<L
             .create_new(true)
             .open(&lock_path)
         {
-            Ok(file) => {
+            Ok(mut file) => {
                 // 记录持有者提示（对齐 proper-lockfile 写 PID/mtime）。
-                let _ = write_holder_hint(&file);
+                let _ = write_holder_hint(&mut file);
                 return Ok(LockGuard { lock_path });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -121,9 +121,8 @@ pub fn lock_sync(file: &Path, options: &LockOptions, wait: bool) -> io::Result<L
     }
 }
 
-fn write_holder_hint(file: &File) -> io::Result<()> {
+fn write_holder_hint(file: &mut File) -> io::Result<()> {
     use std::io::Write;
-    let mut file = file;
     writeln!(file, "{}", std::process::id())
 }
 
@@ -142,6 +141,8 @@ pub fn unlock(file: &Path) -> io::Result<()> {
 }
 
 /// 异步获取文件锁：重试期间让出执行权（用 tokio::time sleep）。
+///
+/// `timeout_ms` 为 0 时只尝试一次（失败立即返回 WouldBlock）。
 pub async fn lock(file: &Path, options: &LockOptions) -> io::Result<LockGuard> {
     let deadline = if options.timeout_ms > 0 {
         Some(SystemTime::now() + Duration::from_millis(options.timeout_ms))
@@ -152,12 +153,13 @@ pub async fn lock(file: &Path, options: &LockOptions) -> io::Result<LockGuard> {
         match lock_sync(file, options, false) {
             Ok(guard) => return Ok(guard),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if let Some(deadline) = deadline {
-                    if SystemTime::now() >= deadline {
-                        return Err(e);
-                    }
+                let Some(deadline) = deadline else {
+                    return Err(e);
+                };
+                if SystemTime::now() >= deadline {
+                    return Err(e);
                 }
-                let interval = if options.timeout_ms > 0 {
+                let interval = if options.retry_interval_ms > 0 {
                     Duration::from_millis(options.retry_interval_ms)
                 } else {
                     Duration::from_millis(100)

@@ -42,7 +42,7 @@ pub struct ClaudeCodeHint {
 
 /// 外层标签匹配。锚定整行（multiline），容忍行首行尾空白。
 static HINT_TAG_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^[ \t]*<claude-code-hint\s+([^>]*?)\s*/>[ \t]*$").expect("valid hint tag regex")
+    Regex::new(r"(?m)^[ \t]*<claude-code-hint\s+([^>]*?)\s*/>[ \t]*$").expect("valid hint tag regex")
 });
 
 /// 属性匹配：`key="value"` 或 `key=value`（空白或 `/>` 结束）。

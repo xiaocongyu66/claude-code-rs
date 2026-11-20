@@ -11,15 +11,16 @@
 //!   - preserve_outputOnError=false：stdout/stderr 清空。
 //!   - spawn 级失败（命令不存在等）：logError 后返回空输出 + code 1。
 //! - 默认 timeout 10 分钟、maxBuffer 1MB、cwd 取 getCwd()。
-//! - Windows 上 execa 自带 .bat/.cmd 兼容处理；Rust 侧若文件名无扩展名，
-//!   在 Windows 上尝试 PATHEXT 后缀（.CMD/.BAT/.EXE），未命中则原样执行。
+//! - Windows 上 execa 自带 .bat/.cmd 兼容处理；Rust 侧偏差：直接执行
+//!   目标文件，未做 PATHEXT/PATHEXT 后缀探测与 cmd /c 包装，调用方在
+//!   Windows 上应传 .exe 或配合 shell:true。
 //!
 //! 偏差：AbortSignal → CancellationToken；异步用 tokio::process。
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::utils::abort_controller::CancellationToken;
@@ -136,9 +137,10 @@ pub async fn exec_file_no_throw_with_cwd(
         cmd.arg(shell_flag).arg(&joined);
         cmd
     } else {
-        Command::new(file)
+        let mut cmd = Command::new(file);
+        cmd.args(args);
+        cmd
     };
-    cmd.args(args);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     if let Some(cwd) = &options.cwd {
@@ -190,30 +192,43 @@ pub async fn exec_file_no_throw_with_cwd(
         }
     }
 
-    // timeout + abort：先 await 输出（wait_with_output 内部收 stdout/stderr）
-    let wait_fut = child.wait_with_output();
-    let output = if timeout == u64::MAX {
-        match wait_fut.await {
-            Ok(output) => Some(output),
+    // 并发读 stdout/stderr（任务形式，避免与 wait 的 borrow 冲突）。
+    // maxBuffer 截断在收集后做（对齐 execa）。
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    let stdout_task = tokio::spawn(read_all_to_vec(stdout_handle));
+    let stderr_task = tokio::spawn(read_all_to_vec(stderr_handle));
+
+    // 等待退出；deadline 到则 kill（try_wait 轮询是为了在超时分支里
+    // 仍能访问 child —— wait() 的借用与 kill 冲突）。
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout);
+    let mut timed_out = false;
+    let mut status: Option<std::process::ExitStatus> = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                status = Some(s);
+                break;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill().await;
+                    timed_out = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
             Err(e) => {
                 log_error(anyhow::anyhow!(e));
-                None
+                break;
             }
         }
-    } else {
-        match tokio::time::timeout(Duration::from_millis(timeout), wait_fut).await {
-            Ok(Ok(output)) => Some(output),
-            Ok(Err(e)) => {
-                log_error(anyhow::anyhow!(e));
-                None
-            }
-            Err(_) => {
-                // 超时：杀子进程
-                let _ = child.start_kill().await;
-                None
-            }
-        }
-    };
+    }
+
+    // 收集 stdout/stderr（任务在子进程退出后自然完成；超时 kill 后
+    // 管道关闭，read 返回 0）
+    let stdout_bytes = stdout_task.await.unwrap_or_default();
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
 
     // abort 检查：token 已 abort 视为失败
     let aborted = options
@@ -222,79 +237,88 @@ pub async fn exec_file_no_throw_with_cwd(
         .map(|t| t.aborted())
         .unwrap_or(false);
 
-    let stdout_string = |out: &std::process::Output| {
-        let mut bytes = out.stdout.clone();
-        bytes.truncate(max_buffer);
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-    let stderr_string = |out: &std::process::Output| {
-        let mut bytes = out.stderr.clone();
-        bytes.truncate(max_buffer);
-        String::from_utf8_lossy(&bytes).into_owned()
+    let mut stdout_bytes = stdout_bytes;
+    stdout_bytes.truncate(max_buffer);
+    let mut stderr_bytes = stderr_bytes;
+    stderr_bytes.truncate(max_buffer);
+    let stdout_string = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr_string = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+    let Some(status) = status else {
+        // wait 本身失败（罕见，如信号采集错误）：当失败处理
+        return ExecFileResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            code: 1,
+            error: None,
+        };
     };
 
-    match output {
-        Some(out) if out.status.success() && !aborted => ExecFileResult {
-            stdout: stdout_string(&out),
-            stderr: stderr_string(&out),
+    if status.success() && !aborted && !timed_out {
+        return ExecFileResult {
+            stdout: stdout_string,
+            stderr: stderr_string,
             code: 0,
             error: None,
-        },
-        Some(out) => {
-            let code = out.status.code().unwrap_or(1);
-            if preserve_output {
-                let signal = signal_name(out.status.signal());
-                let short_message = if aborted {
-                    Some("The user aborted a request".to_string())
-                } else if code != 0 {
-                    Some(format!(
-                        "Command failed with exit code {code}: {file} {}",
-                        args.join(" ")
-                    ))
-                } else {
-                    None
-                };
-                ExecFileResult {
-                    stdout: stdout_string(&out),
-                    stderr: stderr_string(&out),
-                    code,
-                    error: Some(get_error_message(short_message.as_deref(), signal.as_deref(), code)),
-                }
-            } else {
-                ExecFileResult {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    code,
-                    error: None,
-                }
-            }
+        };
+    }
+
+    let code = status.code().unwrap_or(1);
+    if preserve_output {
+        let signal = if timed_out {
+            Some("SIGKILL".to_string())
+        } else {
+            signal_name(exit_signal(&status))
+        };
+        let short_message = if aborted {
+            Some("The user aborted a request".to_string())
+        } else if timed_out {
+            Some(format!("Command timed out after {timeout} ms: {file} {}", args.join(" ")))
+        } else if code != 0 {
+            Some(format!(
+                "Command failed with exit code {code}: {file} {}",
+                args.join(" ")
+            ))
+        } else {
+            None
+        };
+        ExecFileResult {
+            stdout: stdout_string,
+            stderr: stderr_string,
+            code,
+            error: Some(get_error_message(short_message.as_deref(), signal.as_deref(), code)),
         }
-        None => {
-            // spawn 级失败已在上条 arm 处理；超时/abort 走这里
-            if preserve_output {
-                ExecFileResult {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    code: 1,
-                    error: Some(get_error_message(
-                        if aborted {
-                            Some("The user aborted a request")
-                        } else {
-                            Some("exec timed out")
-                        },
-                        None,
-                        1,
-                    )),
-                }
-            } else {
-                ExecFileResult {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    code: 1,
-                    error: None,
-                }
-            }
+    } else {
+        ExecFileResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            code,
+            error: None,
         }
+    }
+}
+
+/// 把子进程的 stdout/stderr 读到 Vec<u8>（None 句柄返回空）。
+async fn read_all_to_vec<R>(mut handle: Option<R>) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    match &mut handle {
+        Some(stream) => {
+            let mut v = Vec::new();
+            let _ = stream.read_to_end(&mut v).await;
+            v
+        }
+        None => Vec::new(),
+    }
+}
+    match handle {
+        Some(mut stream) => {
+            let mut v = Vec::new();
+            let _ = stream.read_to_end(&mut v).await;
+            v
+        }
+        None => Vec::new(),
     }
 }
 
@@ -305,6 +329,16 @@ fn signal_name(code: Option<i32>) -> Option<String> {
         Some(n) => Some(format!("signal {n}")),
         None => None,
     }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 /// 简单 POSIX 引号：空或含空白/特殊字符则单引号包裹并转义内部单引号。

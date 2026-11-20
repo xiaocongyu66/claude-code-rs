@@ -73,7 +73,12 @@ impl SequentialQueue {
         // channel 满只可能发生在队列被 drop 之后；忽略 send 失败，
         // 调用方会通过 orx 收到 QueueDropped。
         let _ = self.sender.send(Job { fut });
-        async move { orx.map_err(|_| SequentialError::QueueDropped).await }
+        async move {
+            match orx.await {
+                Ok(result) => Ok(result),
+                Err(_) => Err(SequentialError::QueueDropped),
+            }
+        }
     }
 }
 

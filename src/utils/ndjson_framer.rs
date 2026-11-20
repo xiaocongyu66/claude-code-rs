@@ -32,8 +32,8 @@ pub struct NdjsonFramerOptions {
     pub max_frame_bytes: Option<usize>,
 }
 
-impl NdjsonFramerOptions {
-    pub const fn default() -> Self {
+impl Default for NdjsonFramerOptions {
+    fn default() -> Self {
         Self {
             max_frame_bytes: None,
         }
