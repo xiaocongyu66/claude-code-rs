@@ -175,9 +175,9 @@ fn match_verbose_at(text: &[char], i: usize) -> Option<VerboseMatch> {
     if i > 0 && is_word(text[i - 1]) {
         return None;
     }
-    let j = if eq_ignore_case(&text[i..], "use") {
+    let j = if i + 3 <= text.len() && eq_ignore_case(&text[i..i + 3], "use") {
         i + 3
-    } else if eq_ignore_case(&text[i..], "spend") {
+    } else if i + 5 <= text.len() && eq_ignore_case(&text[i..i + 5], "spend") {
         i + 5
     } else {
         return None;

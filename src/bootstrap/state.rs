@@ -2203,7 +2203,9 @@ mod tests {
     }
 
     fn get_registered_hashes() -> HashMap<HookEvent, Vec<Arc<dyn RegisteredHookMatcher>>> {
-        get_registered_hooks().expect("hooks registered")
+        // reset_sdk_init_state() 后 hooks 未注册（None），此时应视为空 map，
+        // 与测试断言 `is_empty()` 的语义一致。
+        get_registered_hooks().unwrap_or_default()
     }
 
     #[test]

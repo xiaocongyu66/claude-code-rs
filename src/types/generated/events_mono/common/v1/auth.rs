@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// API 端自动注入的鉴权上下文。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PublicApiAuth {
     /// 账户 ID（数字标识）。
     pub account_id: i64,

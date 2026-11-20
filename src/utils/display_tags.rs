@@ -59,6 +59,8 @@ fn strip_tags<'a>(text: &'a str, allowed: Option<&[&str]>) -> Cow<'a, str> {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
+    // 区分「无匹配」（返回原文零拷贝）与「全部内容都是标签」（返回空串）
+    let mut stripped_any = false;
 
     while i < bytes.len() {
         if bytes[i] == b'<' {
@@ -66,6 +68,7 @@ fn strip_tags<'a>(text: &'a str, allowed: Option<&[&str]>) -> Cow<'a, str> {
                 if matches_tag_name(&name, allowed) {
                     // 非贪婪查找 `</name>`
                     if let Some(block_end) = find_closing_tag(bytes, tag_end, &name) {
+                        stripped_any = true;
                         i = consume_newline(bytes, block_end);
                         continue;
                     }
@@ -84,10 +87,10 @@ fn strip_tags<'a>(text: &'a str, allowed: Option<&[&str]>) -> Cow<'a, str> {
         i = next;
     }
 
-    if out.is_empty() {
-        Cow::Borrowed(text)
-    } else {
+    if stripped_any {
         Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
     }
 }
 

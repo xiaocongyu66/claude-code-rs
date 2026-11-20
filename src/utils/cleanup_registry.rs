@@ -14,20 +14,30 @@ type CleanupFn = Arc<dyn Fn() + Send + Sync>;
 
 static CLEANUP_FUNCTIONS: Mutex<Vec<CleanupFn>> = Mutex::new(Vec::new());
 
-/// 注册一个清理函数；返回的句柄 drop 时摘除该函数（对齐 TS 返回的
-/// unregister 函数）。
+/// 注册一个清理函数；返回的句柄 drop 时执行该函数（若尚未被
+/// run_cleanup_functions 执行过）并从注册表摘除 —— 对齐 TS「进入
+/// 沙盒时注册退出清理、句柄销毁时执行」的语义，同时保证「至多执行
+/// 一次」。
 pub struct CleanupRegistration {
     f: CleanupFn,
 }
 
 impl Drop for CleanupRegistration {
     fn drop(&mut self) {
-        let mut guard = CLEANUP_FUNCTIONS.lock().unwrap_or_else(|p| p.into_inner());
-        guard.retain(|item| !Arc::ptr_eq(item, &self.f));
+        let still_registered = {
+            let mut guard = CLEANUP_FUNCTIONS.lock().unwrap_or_else(|p| p.into_inner());
+            let before = guard.len();
+            guard.retain(|item| !Arc::ptr_eq(item, &self.f));
+            guard.len() < before
+        };
+        // drop 时执行尚未运行过的清理函数
+        if still_registered {
+            (self.f)();
+        }
     }
 }
 
-/// 注册清理函数；返回的 `CleanupRegistration` drop 时取消注册。
+/// 注册清理函数；返回的 `CleanupRegistration` drop 时执行并取消注册。
 pub fn register_cleanup<F>(cleanup_fn: F) -> CleanupRegistration
 where
     F: Fn() + Send + Sync + 'static,
@@ -38,11 +48,12 @@ where
     CleanupRegistration { f }
 }
 
-/// 运行全部已注册的清理函数（TS 的 Promise.all 并发在这里为逐个同步执行）。
+/// 运行全部已注册的清理函数并清空注册表（每个函数只执行一次；
+/// TS 的 Promise.all 并发在这里为逐个同步执行）。
 pub fn run_cleanup_functions() {
     let functions = {
-        let guard = CLEANUP_FUNCTIONS.lock().unwrap_or_else(|p| p.into_inner());
-        guard.clone()
+        let mut guard = CLEANUP_FUNCTIONS.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *guard)
     };
     for f in functions {
         f();

@@ -84,8 +84,10 @@ mod tests {
 
     #[test]
     fn trims_and_preserves_inner_spacing() {
+        // 对齐 TS：input.trim() 两端去白；args 为剩余词按单空格 join，
+        // 内部连续空格以空串词保留（" report   title"，无尾随空格）。
         let parsed = parse_slash_command("  /bug  report   title  ").unwrap();
         assert_eq!(parsed.command_name, "bug");
-        assert_eq!(parsed.args, " report   title ");
+        assert_eq!(parsed.args, " report   title");
     }
 }

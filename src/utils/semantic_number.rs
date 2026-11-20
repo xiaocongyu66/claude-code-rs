@@ -42,8 +42,12 @@ fn is_decimal_literal(s: &str) -> bool {
         return false; // 只有 "-"
     }
     let mut dot_seen = false;
+    let mut int_digits = 0;
     for &b in &bytes[start..] {
         if b.is_ascii_digit() {
+            if !dot_seen {
+                int_digits += 1;
+            }
             continue;
         }
         if b == b'.' && !dot_seen {
@@ -54,6 +58,10 @@ fn is_decimal_literal(s: &str) -> bool {
     }
     // "." 或 "3." 之类不合法：小数点后至少一位（对齐 (\.\d+)?）
     if dot_seen {
+        // ".5" 之类不合法：小数点前至少一位（对齐 ^-?\d+ 的整数部分）
+        if int_digits == 0 {
+            return false;
+        }
         if let Some(dot_pos) = bytes[start..].iter().position(|&b| b == b'.') {
             let frac_len = bytes.len() - start - dot_pos - 1;
             return frac_len >= 1;

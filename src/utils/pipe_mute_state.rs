@@ -196,7 +196,8 @@ mod tests {
         drop(sub);
         state.add_send_override("y");
         assert_eq!(*hits.lock().unwrap(), 2);
+        // 对齐 TS：clearSendOverrides 在集合非空时同样递增版本号（0→4）
         state.clear_send_overrides();
-        assert_eq!(state.get_send_override_version(), 3);
+        assert_eq!(state.get_send_override_version(), 4);
     }
 }

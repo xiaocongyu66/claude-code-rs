@@ -4,12 +4,12 @@
 //! credential_id、agent_id 等）不得出现在错误消息里，以免泄漏到日志、
 //! bug 报告或用户可见文本中；只暴露前 8 个字符。
 
-/// 将 ID 脱敏为前 8 个字符（不足 8 个字符则原样返回）。
+/// 将 ID 脱敏为前 8 个字符（不超过 8 个字符则原样返回）。
 ///
 /// 对齐 TS：`id.length <= 8` 以 UTF-16 码元计数，此处按字符计数
-/// （对 ASCII ID 等价）。
+/// （对 ASCII ID 等价）。取 9 个字符判断 <= 8，避免遍历超长 ID。
 pub fn sanitize_id(id: &str) -> String {
-    if id.chars().take(8).count() < 8 {
+    if id.chars().take(9).count() <= 8 {
         return id.to_string();
     }
     let prefix: String = id.chars().take(8).collect();

@@ -18,11 +18,9 @@ fn normalize_record(record: &mut Value) {
     let Some(map) = record.as_object_mut() else {
         return;
     };
-    //snake_case wins; 只在 requestId 存在且 request_id 不存在时迁移
-    if map.contains_key("requestId") && !map.contains_key("request_id") {
-        if let Some(v) = map.remove("requestId") {
-            map.insert("request_id".to_string(), v);
-        }
+    //snake_case wins; 旧 camelCase 键一律删除，仅当 snake_case 键缺失时迁移值
+    if let Some(v) = map.remove("requestId") {
+        map.entry("request_id".to_string()).or_insert(v);
     }
     if let Some(response) = map.get_mut("response") {
         if response.is_object() {

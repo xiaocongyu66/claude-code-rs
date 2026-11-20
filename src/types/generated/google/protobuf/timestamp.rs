@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 /// 有效范围：秒数须在 `0001-01-01T00:00:00Z` 到 `9999-12-31T23:59:59Z` 之间；
 /// 纳秒部分须为 `0..=999_999_999`。闰秒采用 24 小时线性抹平（smear）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Timestamp {
     /// 自 Unix 纪元起的 UTC 秒数。
     pub seconds: i64,
