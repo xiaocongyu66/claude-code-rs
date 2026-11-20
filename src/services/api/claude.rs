@@ -2,7 +2,7 @@
 //!
 //! 职责（对齐 TS）：
 //! - system prompt 组装（`buildSystemPromptBlocks` / `splitSysPromptPrefix`）
-//! - betas header 计算（`getMergedBetas` / `getModelBetas` / `getExtraBodyParams`）
+//! - betas header 计算（`getMergedBetas` / `getExtraBodyParams`）
 //! - 消息转换（`userMessageToMessageParam` / `assistantMessageToMessageParam` /
 //!   `addCacheBreakpoints` / `stripExcessMediaItems`）
 //! - 请求参数组装（`paramsFromContext` → `build_message_stream_params`）
@@ -15,9 +15,9 @@
 //!   `query_with_model` 保留完整签名，统一返回
 //!   `ApiError::HttpClientUnavailable`，待 reqwest 落地后填充。
 //! - growthbook/statsig 未转换：`tengu_*` 实验门控（1h cache TTL allowlist、
-//!   max-tokens cap、strict tools、token-efficient tools 等）一律按 3P
+//!   max-tokens slot cap、strict tools、token-efficient tools 等）按 3P
 //!   默认值（false）处理；Bedrock 环境变量快速路径与 bootstrap state 的
-//!   latch 逻辑完整保留。
+//!   latch 逻辑完整保留；`currentLimits.isUsingOverage` 按初始值 false。
 //! - `utils/api.ts`、`utils/messages.ts`、`constants/system.ts`、
 //!   `commands/break-cache` 未转换：`split_sys_prompt_prefix`、CLI prefix
 //!   判定、tool_use input 规范化（JSON 解析失败回退 `{}`）等在本模块
@@ -26,8 +26,9 @@
 //!   使用 `ALL_MODEL_CONFIGS` 内置实现，不含 settings modelOverrides 与
 //!   Bedrock inference profile 解析。
 //! - VCR / langfuse / telemetry / headlessProfiler / sessionActivity /
-//!   quota 侧效：HTTP 未接入，均不产生。
-//! - `feature()` 与 TS 约定一致：读取 `FEATURE_<NAME>=1` 环境变量。
+//!   quota / advisor / fastMode 状态机 / searchExtraTools 注入：HTTP 未
+//!   接入或模块未转换，相关动态行为以纯函数 + feature flag env
+//!   （`FEATURE_<NAME>=1`，与 TS 约定一致）表达。
 
 use std::collections::HashMap;
 use std::env;
@@ -35,32 +36,35 @@ use std::fs;
 use std::path::PathBuf;
 
 use chrono::Utc;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::bootstrap::state::{
-    get_afk_mode_header_latched, get_cache_editing_header_latched, get_fast_mode_header_latched,
-    get_is_non_interactive_session, get_prompt_cache_1h_allowlist,
+    add_to_total_cost_state, get_afk_mode_header_latched, get_cache_editing_header_latched,
+    get_fast_mode_header_latched, get_is_non_interactive_session, get_prompt_cache_1h_allowlist,
     get_prompt_cache_1h_eligible, get_sdk_betas, get_session_id, set_afk_mode_header_latched,
     set_cache_editing_header_latched, set_fast_mode_header_latched, set_prompt_cache_1h_allowlist,
     set_prompt_cache_1h_eligible, ModelUsage,
 };
-use crate::constants::api_limits::API_MAX_MEDIA_PER_REQUEST;
 use crate::constants::betas::{
+    afk_mode_beta_header, cli_internal_beta_header, is_bedrock_extra_params_header,
     ADVISOR_BETA_HEADER, CACHE_EDITING_BETA_HEADER, CLAUDE_CODE_20250219_BETA_HEADER,
     CONTEXT_1M_BETA_HEADER, CONTEXT_MANAGEMENT_BETA_HEADER, EFFORT_BETA_HEADER,
     FAST_MODE_BETA_HEADER, INTERLEAVED_THINKING_BETA_HEADER, PROMPT_CACHING_SCOPE_BETA_HEADER,
-    REDACT_THINKING_BETA_HEADER, SEARCH_EXTRA_TOOLS_BETA_HEADER_3P,
-    STRUCTURED_OUTPUTS_BETA_HEADER, TASK_BUDGETS_BETA_HEADER, TOKEN_EFFICIENT_TOOLS_BETA_HEADER,
+    REDACT_THINKING_BETA_HEADER, STRUCTURED_OUTPUTS_BETA_HEADER, TASK_BUDGETS_BETA_HEADER,
     WEB_SEARCH_BETA_HEADER,
 };
+use crate::constants::oauth::OAUTH_BETA_HEADER;
 use crate::constants::query_source::QuerySource;
-use crate::utils::auth::{get_oauth_account_info, is_claude_ai_subscriber};
+use crate::types::connector_text::is_connector_text_block;
+use crate::utils::auth::is_claude_ai_subscriber;
 use crate::utils::context::{
     get_max_thinking_tokens_for_model, get_model_max_output_tokens,
-    get_sonnet_1m_exp_treatment_enabled, has_1m_context, CAPPED_DEFAULT_MAX_TOKENS,
+    get_sonnet_1m_exp_treatment_enabled, has_1m_context,
 };
 use crate::utils::debug::{log_for_debugging, DebugLogLevel};
 use crate::utils::env_utils::{get_claude_config_home_dir, is_env_truthy};
@@ -164,7 +168,7 @@ pub struct BetaUsage {
     pub server_tool_use: Option<ServerToolUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
-    /// 兜底（cache_deleted_input_tokens、iterations 等未建模字段）。
+    /// 兜底（cache_deleted_input_tokens 等未建模字段）。
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -213,14 +217,11 @@ impl BetaMessageDeltaUsage {
     }
 
     /// SDK 类型缺失的 `cache_creation.ephemeral_*`（TS 用 as 强读）。
-    fn cache_creation(&self) -> Option<&CacheCreationBreakdown> {
-        self.extra.get("cache_creation").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                serde_json::from_value::<CacheCreationBreakdown>(v.clone()).ok()
-            }
-        })
+    fn cache_creation(&self) -> Option<CacheCreationBreakdown> {
+        self.extra
+            .get("cache_creation")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value::<CacheCreationBreakdown>(v.clone()).ok())
     }
 }
 
@@ -296,12 +297,8 @@ impl ContentBlockParam {
     }
 
     fn set_str(&mut self, key: &str, value: impl Into<String>) {
-        self.fields.insert(key.to_string(), Value::String(value.into()));
-    }
-
-    fn append_str(&mut self, key: &str, delta: &str) {
-        let prev = self.get_str(key).unwrap_or("").to_string();
-        self.set_str(key, format!("{prev}{delta}"));
+        self.fields
+            .insert(key.to_string(), Value::String(value.into()));
     }
 
     /// 是否 `image` / `document`（`isMedia`）。
@@ -378,7 +375,10 @@ pub struct OutputConfig {
 
 impl OutputConfig {
     pub fn is_empty(&self) -> bool {
-        self.effort.is_none() && self.format.is_none() && self.task_budget.is_none() && self.extra.is_empty()
+        self.effort.is_none()
+            && self.format.is_none()
+            && self.task_budget.is_none()
+            && self.extra.is_empty()
     }
 }
 
@@ -582,9 +582,8 @@ pub struct AssistantMessageBody {
     pub stop_reason: Option<String>,
 }
 
-/// `Message`：user / assistant 联合。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename = "type")]
+/// `Message`：user / assistant 联合（按 `type` 字段区分，仅内存使用）。
+#[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
@@ -626,8 +625,17 @@ const AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX: &str =
     "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
 const AGENT_SDK_PREFIX: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
+/// 流式空闲看门狗默认超时（`CLAUDE_STREAM_IDLE_TIMEOUT_MS` 覆盖）。
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
+
+/// 流式停滞检测阈值（30s，仅诊断日志）。
+pub const STALL_THRESHOLD_MS: u64 = 30_000;
+
 /// `getCLISyspromptPrefix`（`constants/system.ts`）。
-pub fn get_cli_sysprompt_prefix(is_non_interactive: bool, has_append_system_prompt: bool) -> &'static str {
+pub fn get_cli_sysprompt_prefix(
+    is_non_interactive: bool,
+    has_append_system_prompt: bool,
+) -> &'static str {
     if get_api_provider() == ApiProvider::Vertex {
         return DEFAULT_PREFIX;
     }
@@ -640,12 +648,6 @@ pub fn get_cli_sysprompt_prefix(is_non_interactive: bool, has_append_system_prom
     }
     DEFAULT_PREFIX
 }
-
-/// 流式空闲看门狗默认超时（`CLAUDE_STREAM_IDLE_TIMEOUT_MS` 覆盖）。
-pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
-
-/// 流式停滞检测阈值（30s，仅诊断日志）。
-pub const STALL_THRESHOLD_MS: u64 = 30_000;
 
 // ---------------------------------------------------------------------------
 // system prompt 组装
@@ -697,10 +699,10 @@ pub fn split_sys_prompt_prefix(
 
     // 2. 全局缓存 + 边界标记：static / dynamic 分割。
     if use_global_cache_feature {
-        let boundary_index = system_prompt
+        if let Some(boundary_index) = system_prompt
             .iter()
-            .position(|b| b == SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
-        if let Some(boundary_index) = boundary_index {
+            .position(|b| b == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        {
             let mut attribution_header: Option<String> = None;
             let mut system_prompt_prefix: Option<String> = None;
             let mut static_blocks: Vec<String> = Vec::new();
@@ -768,6 +770,14 @@ pub fn split_sys_prompt_prefix(
     result
 }
 
+/// `buildSystemPromptBlocks` 的选项。
+#[derive(Debug, Clone, Default)]
+pub struct BuildSystemPromptOptions {
+    /// `skipGlobalCacheForSystemPrompt`（存在 MCP 工具时跳过全局缓存）。
+    pub skip_global_cache_for_system_prompt: bool,
+    pub query_source: Option<String>,
+}
+
 /// `buildSystemPromptBlocks`：系统提示 → `TextBlockParam[]`（含 cache_control）。
 pub fn build_system_prompt_blocks(
     system_prompt: &SystemPrompt,
@@ -789,14 +799,6 @@ pub fn build_system_prompt_blocks(
             },
         })
         .collect()
-}
-
-/// `buildSystemPromptBlocks` 的选项。
-#[derive(Debug, Clone, Default)]
-pub struct BuildSystemPromptOptions {
-    /// `skipGlobalCacheForSystemPrompt`（存在 MCP 工具时跳过全局缓存）。
-    pub skip_global_cache_for_system_prompt: bool,
-    pub query_source: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +829,12 @@ pub fn get_cache_control(opts: CacheControlOpts) -> CacheControl {
     }
 }
 
+/// `currentLimits.isUsingOverage`（`services/claudeAiLimits.ts` 未转换 →
+/// 按初始值 false）。
+fn is_using_overage() -> bool {
+    false
+}
+
 /// `should1hCacheTTL`（GrowthBook allowlist 部分按未配置处理）。
 pub fn should_1h_cache_ttl(query_source: Option<&str>) -> bool {
     // 3P Bedrock 用户通过环境变量开启 1h TTL（自助计费，无需 GrowthBook）。
@@ -836,12 +844,15 @@ pub fn should_1h_cache_ttl(query_source: Option<&str>) -> bool {
         return true;
     }
 
-    //Latch 资格到 bootstrap state，保证会话内 TTL 稳定。
+    // Latch 资格到 bootstrap state，保证会话内 TTL 稳定（防止 mid-session
+    // overage 翻转改变 cache_control TTL，击穿服务端 ~20K token 的缓存）。
     let mut user_eligible = get_prompt_cache_1h_eligible();
     if user_eligible.is_none() {
         user_eligible = Some(
-            env::var("USER_TYPE").map(|t| t == "ant").unwrap_or(false)
-                || (is_claude_ai_subscriber() && !crate::bootstrap::state::current_limits_is_using_overage()),
+            env::var("USER_TYPE")
+                .map(|t| t == "ant")
+                .unwrap_or(false)
+                || (is_claude_ai_subscriber() && !is_using_overage()),
         );
         set_prompt_cache_1h_eligible(user_eligible);
     }
@@ -849,7 +860,7 @@ pub fn should_1h_cache_ttl(query_source: Option<&str>) -> bool {
         return false;
     }
 
-    // Latch allowlist；GrowthBook 未接入时缓存一次后恒为空表。
+    // Latch allowlist；GrowthBook 未接入时缓存空表（仅 latch 语义保留）。
     let mut allowlist = get_prompt_cache_1h_allowlist();
     if allowlist.is_none() {
         allowlist = Some(Vec::new());
@@ -875,17 +886,17 @@ pub fn get_prompt_caching_enabled(model: &str) -> bool {
         return false;
     }
     if is_env_truthy(env::var("DISABLE_PROMPT_CACHING_HAIKU").ok().as_deref())
-        && model == get_small_fast_model().as_str()
+        && model == get_small_fast_model()
     {
         return false;
     }
     if is_env_truthy(env::var("DISABLE_PROMPT_CACHING_SONNET").ok().as_deref())
-        && model == get_default_sonnet_model().as_str()
+        && model == get_default_sonnet_model()
     {
         return false;
     }
     if is_env_truthy(env::var("DISABLE_PROMPT_CACHING_OPUS").ok().as_deref())
-        && model == get_default_opus_model().as_str()
+        && model == get_default_opus_model()
     {
         return false;
     }
@@ -905,7 +916,7 @@ pub fn get_extra_body_params(beta_headers: Option<&[String]>) -> Map<String, Val
         if !extra_body_str.is_empty() {
             match serde_json::from_str::<Value>(&extra_body_str) {
                 Ok(Value::Object(parsed)) => {
-                    // 浅拷贝——不可变，直接吸收 map。
+                    // 浅拷贝（直接吸收 map），不会污染后续 result 变更。
                     result = parsed;
                 }
                 Ok(_) => {
@@ -932,7 +943,7 @@ pub fn get_extra_body_params(beta_headers: Option<&[String]>) -> Map<String, Val
                 Some(Value::Array(existing)) => {
                     let new_headers: Vec<Value> = headers
                         .iter()
-                        .filter(|h| !existing.iter().any(|v| v == h))
+                        .filter(|h| !existing.iter().any(|v| v.as_str() == Some(h)))
                         .map(|h| Value::String(h.clone()))
                         .collect();
                     let mut merged = existing.clone();
@@ -974,10 +985,7 @@ pub fn get_api_metadata() -> ApiMetadata {
     }
     extra.insert("device_id".to_string(), Value::String(get_or_create_user_id()));
     extra.insert("account_uuid".to_string(), Value::String(String::new()));
-    extra.insert(
-        "session_id".to_string(),
-        Value::String(get_session_id().0),
-    );
+    extra.insert("session_id".to_string(), Value::String(get_session_id().0));
     ApiMetadata {
         user_id: serde_json::to_string(&extra).unwrap_or_default(),
     }
@@ -1020,33 +1028,6 @@ fn random_hex_32() -> String {
 // 请求参数（paramsFromContext）
 // ---------------------------------------------------------------------------
 
-/// `Options`（`claude.ts`）：query 层传入的请求选项。
-///
-/// 偏差：不含回调类字段（`getToolPermissionContext` / `onStreamingFallback` /
-/// `addNotification`）与 `fetchOverride`（HTTP 未接入）、`mcpTools` /
-/// `queryTracking` / `agents` / `langfuseTrace`。
-#[derive(Debug, Clone, Default)]
-pub struct Options {
-    pub model: String,
-    pub tool_choice: Option<ToolChoice>,
-    pub is_non_interactive_session: bool,
-    pub extra_tool_schemas: Vec<ToolParam>,
-    pub max_output_tokens_override: Option<i64>,
-    pub fallback_model: Option<String>,
-    pub query_source: QuerySource,
-    pub has_append_system_prompt: bool,
-    pub enable_prompt_caching: Option<bool>,
-    pub skip_cache_write: bool,
-    pub temperature_override: Option<f64>,
-    pub effort_value: Option<EffortValue>,
-    pub output_format: Option<JsonOutputFormat>,
-    pub fast_mode: bool,
-    pub advisor_model: Option<String>,
-    pub task_budget: Option<TaskBudget>,
-    pub agent_id: Option<String>,
-    pub has_pending_mcp_servers: bool,
-}
-
 /// `EffortValue`：`'high' | 'medium' | 'low' | 'max' | number`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -1074,7 +1055,34 @@ impl EffortLevel {
     }
 }
 
-/// `getAPIMetadata` 的请求参数：queryModel 一次性算好的上下文。
+/// `Options`（`claude.ts`）：query 层传入的请求选项。
+///
+/// 偏差：不含回调类字段（`getToolPermissionContext` / `onStreamingFallback` /
+/// `addNotification`）与 `fetchOverride`（HTTP 未接入）、`mcpTools` /
+/// `queryTracking` / `agents` / `langfuseTrace` / `allowedAgentTypes`。
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    pub model: String,
+    pub tool_choice: Option<ToolChoice>,
+    pub is_non_interactive_session: bool,
+    pub extra_tool_schemas: Vec<ToolParam>,
+    pub max_output_tokens_override: Option<i64>,
+    pub fallback_model: Option<String>,
+    pub query_source: QuerySource,
+    pub has_append_system_prompt: bool,
+    pub enable_prompt_caching: Option<bool>,
+    pub skip_cache_write: bool,
+    pub temperature_override: Option<f64>,
+    pub effort_value: Option<EffortValue>,
+    pub output_format: Option<JsonOutputFormat>,
+    pub fast_mode: bool,
+    pub advisor_model: Option<String>,
+    pub task_budget: Option<TaskBudget>,
+    pub agent_id: Option<String>,
+    pub has_pending_mcp_servers: bool,
+}
+
+/// queryModel 一次性算好的上下文（`paramsFromContext` 的入参）。
 #[derive(Debug, Clone)]
 pub struct RequestSpec<'a> {
     pub options: &'a Options,
@@ -1091,7 +1099,7 @@ pub struct RequestSpec<'a> {
     pub max_tokens_override: Option<i64>,
     /// `retryContext.fastMode`（withRetry 传入的 fastMode）。
     pub retry_fast_mode: bool,
-    /// sticky-on latches（queryModel 内 latch 后传入）。
+    /// sticky-on latches（`compute_beta_header_latches` 产出）。
     pub fast_mode_header_latched: bool,
     pub afk_header_latched: bool,
     pub cache_editing_header_latched: bool,
@@ -1116,26 +1124,31 @@ pub struct MessageStreamParams {
     pub thinking: Option<ThinkingParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// `context_management`（`services/compact/apiMicrocompact.ts` 未转换 → 不产出。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
-    /// 计算出的 extra body params（env）。序列化时**覆盖**同名字段，
+    /// 计算出的 extra body params（env）。
+    ///
+    /// 不参与结构体序列化；`into_request_body` 在序列化后**覆盖**同名字段，
     /// 对齐 TS `{ ...computed, ...extraBodyParams }` 的展开顺序。
-    #[serde(skip_serializing_if = "Map::is_empty")]
+    #[serde(skip)]
     pub extra_body: Map<String, Value>,
 }
 
 impl MessageStreamParams {
     /// 序列化为请求体 JSON：extra_body 字段覆盖计算字段（对齐 TS 展开）。
-    pub fn into_request_body(mut self) -> Value {
+    pub fn into_request_body(self) -> Value {
+        let extra_body = self.extra_body;
         let mut value = serde_json::to_value(&self).unwrap_or(Value::Null);
-        let extra = std::mem::take(&mut self.extra_body);
-        if let Value::Object(map) = &mut value {
-            for (k, v) in extra {
-                map.insert(k, v);
+        if !extra_body.is_empty() {
+            if let Value::Object(map) = &mut value {
+                for (k, v) in extra_body {
+                    map.insert(k, v);
+                }
             }
         }
         value
@@ -1175,7 +1188,7 @@ pub fn build_message_stream_params(spec: &RequestSpec) -> MessageStreamParams {
         .get("anthropic_internal")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-    let effort = resolve_applied_effort(&options.model, options.effort.as_ref());
+    let effort = resolve_applied_effort(&options.model, options.effort_value.as_ref());
     configure_effort_params_internal(
         &options.model,
         effort.as_ref(),
@@ -1187,7 +1200,11 @@ pub fn build_message_stream_params(spec: &RequestSpec) -> MessageStreamParams {
         extra_body_params.insert("anthropic_internal".to_string(), Value::Object(internal));
     }
 
-    configure_task_budget_params(options.task_budget.as_ref(), &mut output_config, &mut betas_params);
+    configure_task_budget_params(
+        options.task_budget.as_ref(),
+        &mut output_config,
+        &mut betas_params,
+    );
 
     // outputFormat 与 structured outputs beta。
     if let Some(format) = &options.output_format {
@@ -1219,7 +1236,7 @@ pub fn build_message_stream_params(spec: &RequestSpec) -> MessageStreamParams {
         } else {
             let mut thinking_budget = i64::from(get_max_thinking_tokens_for_model(&options.model));
             if let ThinkingConfig::Enabled { budget_tokens } = spec.thinking_config {
-                thinking_budget = budget_tokens;
+                thinking_budget = *budget_tokens;
             }
             thinking_budget = thinking_budget.min(max_output_tokens - 1);
             thinking = Some(ThinkingParam::Enabled {
@@ -1228,7 +1245,7 @@ pub fn build_message_stream_params(spec: &RequestSpec) -> MessageStreamParams {
         }
     }
 
-    // Fast mode：speed 字段动态、header latched（缓存稳定）。
+    // Fast mode：speed 字段动态、header latched（缓存键稳定）。
     let mut speed: Option<String> = None;
     let is_fast_mode_for_retry = is_fast_mode_enabled()
         && is_fast_mode_available()
@@ -1248,9 +1265,9 @@ pub fn build_message_stream_params(spec: &RequestSpec) -> MessageStreamParams {
     if spec.afk_header_latched
         && should_include_first_party_only_betas()
         && is_agentic_query_source(&options.query_source)
-        && !betas_params.contains(&crate::constants::betas::afk_mode_beta_header().to_string())
+        && !betas_params.contains(&afk_mode_beta_header().to_string())
     {
-        betas_params.push(crate::constants::betas::afk_mode_beta_header().to_string());
+        betas_params.push(afk_mode_beta_header().to_string());
     }
 
     // Cache editing beta：header latched，body 行为保持动态。
@@ -1275,9 +1292,8 @@ pub fn build_message_stream_params(spec: &RequestSpec) -> MessageStreamParams {
     };
 
     // 过滤空串 beta（未开启功能的常量头为 ''，发出去会 400）。
-    let filtered_betas: Vec<String> = betas_params.into_iter().filter(|b| !b.is_empty()).collect();
-
     let use_betas = !spec.base_betas.is_empty();
+    let filtered_betas: Vec<String> = betas_params.into_iter().filter(|b| !b.is_empty()).collect();
 
     MessageStreamParams {
         model: normalize_model_string_for_api(&options.model),
@@ -1290,7 +1306,6 @@ pub fn build_message_stream_params(spec: &RequestSpec) -> MessageStreamParams {
         max_tokens: max_output_tokens,
         thinking,
         temperature,
-        // context_management 需要 `services/compact/apiMicrocompact` 未转换，暂不产出。
         context_management: None,
         output_config: if output_config.is_empty() {
             None
@@ -1298,7 +1313,7 @@ pub fn build_message_stream_params(spec: &RequestSpec) -> MessageStreamParams {
             Some(output_config)
         },
         speed,
-        extra_body_params,
+        extra_body: extra_body_params,
     }
 }
 
@@ -1337,13 +1352,12 @@ pub fn configure_task_budget_params(
     output_config: &mut OutputConfig,
     betas: &mut Vec<String>,
 ) {
-    if task_budget.is_none()
-        || output_config.task_budget.is_some()
-        || !should_include_first_party_only_betas()
-    {
+    let Some(budget) = task_budget else {
+        return;
+    };
+    if output_config.task_budget.is_some() || !should_include_first_party_only_betas() {
         return;
     }
-    let budget = task_budget.unwrap();
     output_config.task_budget = Some(TaskBudgetParam {
         typ: "tokens".to_string(),
         total: budget.total,
@@ -1356,26 +1370,29 @@ pub fn configure_task_budget_params(
 
 /// `resolveAppliedEffort`：env `CLAUDE_CODE_EFFORT_LEVEL`（`unset`/`auto`
 /// 表示不发）→ appState → 模型默认（ant 专属，未接入 → None）。
-pub fn resolve_applied_effort(_model: &str, app_state_effort: Option<&EffortValue>) -> Option<EffortValue> {
-    let env_override = effort_env_override();
-    if env_override.is_none() {
-        return None;
+pub fn resolve_applied_effort(
+    _model: &str,
+    app_state_effort: Option<&EffortValue>,
+) -> Option<EffortValue> {
+    match effort_env_override() {
+        // env 显式 unset/auto → 不发送。
+        Some(None) => None,
+        // env 给了具体值。
+        Some(v) => v,
+        // 未设置 env → appState → 模型默认。
+        None => app_state_effort.cloned(),
     }
-    env_override.or_else(|| app_state_effort.cloned())
 }
 
-fn effort_env_override() -> Option<EffortValue> {
+/// `getEffortEnvOverride`：`None` = 未设置；`Some(None)` = unset/auto。
+fn effort_env_override() -> Option<Option<EffortValue>> {
     let raw = env::var("CLAUDE_CODE_EFFORT_LEVEL").ok()?;
     let lower = raw.to_ascii_lowercase();
     if lower == "unset" || lower == "auto" {
-        return None(None); // `null`：显式不发送
+        return Some(None);
     }
-    parse_effort_value(&raw)
+    Some(parse_effort_value(&raw))
 }
-
-// `Option<Option<T>>` 区分「未设置」与「显式 unset/auto」。
-#[allow(clippy::allow_attributes, unused)]
-fn none_marker() {}
 
 fn parse_effort_value(raw: &str) -> Option<EffortValue> {
     match raw.to_ascii_lowercase().as_str() {
@@ -1391,15 +1408,14 @@ fn parse_effort_value(raw: &str) -> Option<EffortValue> {
 // max output tokens / timeout
 // ---------------------------------------------------------------------------
 
-/// `getMaxOutputTokensForModel`：模型默认 + env 覆盖（slot cap 实验未接入）。
+/// `getMaxOutputTokensForModel`：模型默认 + env 覆盖
+/// （`tengu_otk_slot_v1` slot cap 实验未接入 → 不封顶）。
 pub fn get_max_output_tokens_for_model(model: &str) -> i64 {
     let max_output_tokens = get_model_max_output_tokens(model);
-    // `isMaxTokensCapEnabled`（tengu_otk_slot_v1）GrowthBook 未接入 → false（3P 默认）。
-    let default_tokens = i64::from(max_output_tokens.default);
     validate_bounded_int_env_var(
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
         env::var("CLAUDE_CODE_MAX_OUTPUT_TOKENS").ok().as_deref(),
-        default_tokens.min(i64::from(CAPPED_DEFAULT_MAX_TOKENS)),
+        i64::from(max_output_tokens.default),
         i64::from(max_output_tokens.upper_limit),
     )
     .effective
@@ -1434,10 +1450,23 @@ pub fn adjust_params_for_non_streaming(params: &mut MessageStreamParams, max_tok
 // 消息转换
 // ---------------------------------------------------------------------------
 
+fn text_block_with_cache(text: &str, cache_control: Option<CacheControl>) -> Value {
+    let mut block = Map::new();
+    block.insert("type".to_string(), Value::String("text".to_string()));
+    block.insert("text".to_string(), Value::String(text.to_string()));
+    if let Some(cc) = cache_control {
+        block.insert(
+            "cache_control".to_string(),
+            serde_json::to_value(cc).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(block)
+}
+
 /// `userMessageToMessageParam`。
 ///
 /// `add_cache=true` 时给最后一个内容块加 `cache_control`（字符串内容
-/// 包一层 text 块）。非缓存路径克隆数组内容，避免原地变异污染原消息。
+/// 包一层 text 块）。非缓存路径克隆内容，避免原地变异污染原消息。
 pub fn user_message_to_message_param(
     message: &UserMessage,
     add_cache: bool,
@@ -1448,14 +1477,13 @@ pub fn user_message_to_message_param(
         match &message.message.content {
             MessageContent::Text(text) => MessageParam {
                 role: "user".to_string(),
-                content: MessageContent::Blocks(vec![json!({
-                    "type": "text",
-                    "text": text,
-                    "cache_control": enable_prompt_caching.then(|| get_cache_control(CacheControlOpts {
+                content: MessageContent::Blocks(vec![text_block_with_cache(
+                    text,
+                    enable_prompt_caching.then(|| get_cache_control(CacheControlOpts {
                         query_source,
                         ..Default::default()
                     })),
-                })]),
+                )]),
             },
             MessageContent::Blocks(blocks) => {
                 let last = blocks.len().saturating_sub(1);
@@ -1464,7 +1492,7 @@ pub fn user_message_to_message_param(
                     .enumerate()
                     .map(|(i, block)| {
                         if i == last && enable_prompt_caching {
-                            let mut obj = block.clone();
+                            let mut obj = strip_gemini_provider_metadata_value(block);
                             if let Value::Object(map) = &mut obj {
                                 map.insert(
                                     "cache_control".to_string(),
@@ -1496,7 +1524,7 @@ pub fn user_message_to_message_param(
     }
 }
 
-/// `assistantMessageToMessageParam`：思考 / redacted_thinking /
+/// `assistantMessageToMessageParam`：thinking / redacted_thinking /
 /// connector_text 块不加缓存标记（API 约束）。
 pub fn assistant_message_to_message_param(
     message: &AssistantMessage,
@@ -1508,14 +1536,13 @@ pub fn assistant_message_to_message_param(
         match &message.message.content {
             MessageContent::Text(text) => MessageParam {
                 role: "assistant".to_string(),
-                content: MessageContent::Blocks(vec![json!({
-                    "type": "text",
-                    "text": text,
-                    "cache_control": enable_prompt_caching.then(|| get_cache_control(CacheControlOpts {
+                content: MessageContent::Blocks(vec![text_block_with_cache(
+                    text,
+                    enable_prompt_caching.then(|| get_cache_control(CacheControlOpts {
                         query_source,
                         ..Default::default()
                     })),
-                })]),
+                )]),
             },
             MessageContent::Blocks(blocks) => {
                 let last = blocks.len().saturating_sub(1);
@@ -1532,9 +1559,7 @@ pub fn assistant_message_to_message_param(
                                     t != "thinking"
                                         && t != "redacted_thinking"
                                         && (!feature("CONNECTOR_TEXT")
-                                            || !crate::types::connector_text::is_connector_text_block(
-                                                block,
-                                            ))
+                                            || !is_connector_text_block(block))
                                 })
                                 .unwrap_or(true);
                         if can_cache && enable_prompt_caching {
@@ -1566,9 +1591,9 @@ pub fn assistant_message_to_message_param(
             role: "assistant".to_string(),
             content: match &message.message.content {
                 MessageContent::Text(text) => MessageContent::Text(text.clone()),
-                MessageContent::Blocks(blocks) => {
-                    MessageContent::Blocks(blocks.iter().map(strip_gemini_provider_metadata_value).collect())
-                }
+                MessageContent::Blocks(blocks) => MessageContent::Blocks(
+                    blocks.iter().map(strip_gemini_provider_metadata_value).collect(),
+                ),
             },
         }
     }
@@ -1592,12 +1617,27 @@ fn strip_gemini_provider_metadata_value(block: &Value) -> Value {
     }
 }
 
+fn is_media_value(block: &Value) -> bool {
+    block
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|t| t == "image" || t == "document")
+        .unwrap_or(false)
+}
+
+fn is_tool_result_value(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("tool_result")
+        && block.get("tool_use_id").is_some()
+}
+
+/// `isMedia`（对齐 claude.ts 的类型守卫）。
+pub fn is_media(block: &ContentBlockParam) -> bool {
+    block.is_media()
+}
+
 /// `stripExcessMediaItems`：保证 media（image/document）块数 ≤ limit，
 /// 优先剥离最旧的（含 tool_result 内嵌的 media）。
-pub fn strip_excess_media_items(
-    messages: &[Message],
-    limit: u32,
-) -> Vec<Message> {
+pub fn strip_excess_media_items(messages: &[Message], limit: u32) -> Vec<Message> {
     let mut to_remove: i64 = 0;
     for msg in messages {
         let Message::User(m) = msg else {
@@ -1612,7 +1652,10 @@ pub fn strip_excess_media_items(
             }
             if is_tool_result_value(block) {
                 if let Some(nested) = block.get("content").and_then(Value::as_array) {
-                    to_remove += i64::try_from(nested.iter().filter(|b| is_media_value(b)).count()).unwrap_or(0);
+                    to_remove += i64::try_from(
+                        nested.iter().filter(|b| is_media_value(b)).count(),
+                    )
+                    .unwrap_or(0);
                 }
             }
         }
@@ -1636,7 +1679,8 @@ pub fn strip_excess_media_items(
             };
             let before = to_remove;
 
-            let stripped: Vec<Value> = content
+            // 先剥离 tool_result 内嵌 media，再剥离顶层 media。
+            let mapped: Vec<Value> = content
                 .iter()
                 .map(|block| {
                     if to_remove <= 0 || !is_tool_result_value(block) {
@@ -1667,6 +1711,9 @@ pub fn strip_excess_media_items(
                         Value::Object(obj)
                     }
                 })
+                .collect();
+            let stripped: Vec<Value> = mapped
+                .into_iter()
                 .filter(|block| {
                     if to_remove > 0 && is_media_value(block) {
                         to_remove -= 1;
@@ -1678,7 +1725,7 @@ pub fn strip_excess_media_items(
                 .collect();
 
             if before == to_remove {
-                msg.clone().into()
+                msg.clone()
             } else {
                 Message::User(UserMessage {
                     message: UserMessageBody {
@@ -1694,22 +1741,50 @@ pub fn strip_excess_media_items(
         .collect()
 }
 
-/// `isMedia`（按 JSON 形状判定）。
-pub fn is_media(block: &ContentBlockParam) -> bool {
-    block.is_media()
+/// `CachedMCEditsBlock`：cache editing 的删除指令块。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheEditsBlock {
+    #[serde(rename = "type")]
+    pub type_field: String, // "cache_edits"
+    pub edits: Vec<CacheEdit>,
 }
 
-fn is_media_value(block: &Value) -> bool {
-    block
-        .get("type")
-        .and_then(Value::as_str)
-        .map(|t| t == "image" || t == "document")
-        .unwrap_or(false)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheEdit {
+    #[serde(rename = "type")]
+    pub type_field: String, // "delete"
+    pub cache_reference: String,
 }
 
-fn is_tool_result_value(block: &Value) -> bool {
-    block.get("type").and_then(Value::as_str) == Some("tool_result")
-        && block.get("tool_use_id").is_some()
+/// `CachedMCPinnedEdits`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedCacheEdits {
+    pub user_message_index: usize,
+    pub block: CacheEditsBlock,
+}
+
+fn ensure_blocks_content(msg: &mut MessageParam) {
+    if let MessageContent::Text(text) = &msg.content {
+        msg.content = MessageContent::Blocks(vec![json!({
+            "type": "text",
+            "text": text,
+        })]);
+    }
+}
+
+/// `insertBlockAfterToolResults`（`utils/contentArray.ts` 最小等价）：
+/// 将 cache_edits 块插入到最后一个 tool_result 之后（无 tool_result 则末尾）。
+fn insert_block_after_tool_results_msg(msg: &mut MessageParam, block: &CacheEditsBlock) {
+    let MessageContent::Blocks(blocks) = &mut msg.content else {
+        return;
+    };
+    let block_value = serde_json::to_value(block).unwrap_or(Value::Null);
+    let insert_at = blocks
+        .iter()
+        .rposition(|b| is_tool_result_value(b))
+        .map(|i| i + 1)
+        .unwrap_or_else(|| blocks.len());
+    blocks.insert(insert_at, block_value);
 }
 
 /// `addCacheBreakpoints`：给最后一条（或倒数第二条，skipCacheWrite）消息
@@ -1736,12 +1811,9 @@ pub fn add_cache_breakpoints(
         .map(|(index, msg)| {
             let add_cache = index == marker_index;
             match msg {
-                Message::User(m) => user_message_to_message_param(
-                    m,
-                    add_cache,
-                    enable_prompt_caching,
-                    query_source,
-                ),
+                Message::User(m) => {
+                    user_message_to_message_param(m, add_cache, enable_prompt_caching, query_source)
+                }
                 Message::Assistant(a) => assistant_message_to_message_param(
                     a,
                     add_cache,
@@ -1852,52 +1924,6 @@ pub fn add_cache_breakpoints(
     result
 }
 
-/// `CachedMCEditsBlock`：cache editing 的删除指令块。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheEditsBlock {
-    #[serde(rename = "type")]
-    pub type_field: String, // "cache_edits"
-    pub edits: Vec<CacheEdit>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheEdit {
-    #[serde(rename = "type")]
-    pub type_field: String, // "delete"
-    pub cache_reference: String,
-}
-
-/// `CachedMCPinnedEdits`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PinnedCacheEdits {
-    pub user_message_index: usize,
-    pub block: CacheEditsBlock,
-}
-
-fn ensure_blocks_content(msg: &mut MessageParam) {
-    if let MessageContent::Text(text) = &msg.content {
-        msg.content = MessageContent::Blocks(vec![json!({
-            "type": "text",
-            "text": text,
-        })]);
-    }
-}
-
-/// `insertBlockAfterToolResults`（`utils/contentArray.ts` 最小等价）：
-/// 将 cache_edits 块插入到最后一个 tool_result 之后（无 tool_result 则末尾）。
-fn insert_block_after_tool_results_msg(msg: &mut MessageParam, block: &CacheEditsBlock) {
-    let MessageContent::Blocks(blocks) = &mut msg.content else {
-        return;
-    };
-    let block_value = serde_json::to_value(block).unwrap_or(Value::Null);
-    let insert_at = blocks
-        .iter()
-        .rposition(|b| is_tool_result_value(b))
-        .map(|i| i + 1)
-        .unwrap_or_else(|| blocks.len());
-    blocks.insert(insert_at, block_value);
-}
-
 /// `getPreviousRequestIdFromMessages`：逆序找最后一条带 requestId 的助手消息。
 pub fn get_previous_request_id_from_messages(messages: &[Message]) -> Option<String> {
     messages
@@ -1914,7 +1940,10 @@ pub fn get_previous_request_id_from_messages(messages: &[Message]) -> Option<Str
 ///
 /// 输入类 token（input/cache_creation/cache_read）只在事件给出 >0 值时
 /// 覆盖（message_delta 可能显式补 0）；output_tokens 使用最新值。
-pub fn update_usage(usage: &NonNullableUsage, part_usage: Option<&BetaMessageDeltaUsage>) -> NonNullableUsage {
+pub fn update_usage(
+    usage: &NonNullableUsage,
+    part_usage: Option<&BetaMessageDeltaUsage>,
+) -> NonNullableUsage {
     let mut out = usage.clone();
     let Some(part) = part_usage else {
         return out;
@@ -1946,7 +1975,7 @@ pub fn update_usage(usage: &NonNullableUsage, part_usage: Option<&BetaMessageDel
     // cache_deleted_input_tokens：API cache editing 的真实返回字段（>0 才覆盖）。
     if feature("CACHED_MICROCOMPACT") {
         if let Some(deleted) = part.field_i64("cache_deleted_input_tokens") {
-            if deleted != 0 && deleted > 0 {
+            if deleted > 0 {
                 out.cache_deleted_input_tokens = Some(deleted);
             }
         }
@@ -1961,12 +1990,16 @@ pub fn update_usage(usage: &NonNullableUsage, part_usage: Option<&BetaMessageDel
 }
 
 /// `accumulateUsage`：跨多个助手回合累计 usage。
-pub fn accumulate_usage(total: &NonNullableUsage, message_usage: &NonNullableUsage) -> NonNullableUsage {
+pub fn accumulate_usage(
+    total: &NonNullableUsage,
+    message_usage: &NonNullableUsage,
+) -> NonNullableUsage {
     let mut out = NonNullableUsage {
         input_tokens: total.input_tokens + message_usage.input_tokens,
         cache_creation_input_tokens: total.cache_creation_input_tokens
             + message_usage.cache_creation_input_tokens,
-        cache_read_input_tokens: total.cache_read_input_tokens + message_usage.cache_read_input_tokens,
+        cache_read_input_tokens: total.cache_read_input_tokens
+            + message_usage.cache_read_input_tokens,
         output_tokens: total.output_tokens + message_usage.output_tokens,
         server_tool_use: ServerToolUsage {
             web_search_requests: total.server_tool_use.web_search_requests
@@ -2030,7 +2063,9 @@ pub fn model_supports_structured_outputs(model: &str) -> bool {
 
 /// `modelSupportsISP`（interleaved thinking）。
 pub fn model_supports_isp(model: &str) -> bool {
-    if let Some(v) = get_3p_model_capability_override(model, ModelCapabilityOverride::InterleavedThinking) {
+    if let Some(v) =
+        get_3p_model_capability_override(model, ModelCapabilityOverride::InterleavedThinking)
+    {
         return v;
     }
     let canonical = canonical_name(model);
@@ -2118,16 +2153,18 @@ pub fn get_all_model_betas(model: &str) -> Vec<String> {
 
     if !is_haiku {
         beta_headers.push(CLAUDE_CODE_20250219_BETA_HEADER.to_string());
-        let cli_internal = crate::constants::betas::cli_internal_beta_header();
+        let cli_internal = cli_internal_beta_header();
         if !cli_internal.is_empty()
             && env::var("USER_TYPE").map(|t| t == "ant").unwrap_or(false)
-            && env::var("CLAUDE_CODE_ENTRYPOINT").map(|e| e == "cli").unwrap_or(false)
+            && env::var("CLAUDE_CODE_ENTRYPOINT")
+                .map(|e| e == "cli")
+                .unwrap_or(false)
         {
             beta_headers.push(cli_internal.to_string());
         }
     }
     if is_claude_ai_subscriber() {
-        beta_headers.push(crate::constants::oauth::OAUTH_BETA_HEADER.to_string());
+        beta_headers.push(OAUTH_BETA_HEADER.to_string());
     }
     if has_1m_context(model) {
         beta_headers.push(CONTEXT_1M_BETA_HEADER.to_string());
@@ -2186,7 +2223,7 @@ pub fn get_model_betas(model: &str) -> Vec<String> {
     if get_api_provider() == ApiProvider::Bedrock {
         model_betas
             .into_iter()
-            .filter(|b| !crate::constants::betas::is_bedrock_extra_params_header(b))
+            .filter(|b| !is_bedrock_extra_params_header(b))
             .collect()
     } else {
         model_betas
@@ -2197,7 +2234,7 @@ pub fn get_model_betas(model: &str) -> Vec<String> {
 pub fn get_bedrock_extra_body_params_betas(model: &str) -> Vec<String> {
     get_all_model_betas(model)
         .into_iter()
-        .filter(|b| crate::constants::betas::is_bedrock_extra_params_header(b))
+        .filter(|b| is_bedrock_extra_params_header(b))
         .collect()
 }
 
@@ -2209,11 +2246,13 @@ pub fn get_merged_betas(model: &str, is_agentic_query: bool) -> Vec<String> {
         if !base_betas.contains(&CLAUDE_CODE_20250219_BETA_HEADER.to_string()) {
             base_betas.push(CLAUDE_CODE_20250219_BETA_HEADER.to_string());
         }
-        let cli_internal = crate::constants::betas::cli_internal_beta_header();
+        let cli_internal = cli_internal_beta_header();
         if !cli_internal.is_empty()
             && !base_betas.contains(&cli_internal.to_string())
             && env::var("USER_TYPE").map(|t| t == "ant").unwrap_or(false)
-            && env::var("CLAUDE_CODE_ENTRYPOINT").map(|e| e == "cli").unwrap_or(false)
+            && env::var("CLAUDE_CODE_ENTRYPOINT")
+                .map(|e| e == "cli")
+                .unwrap_or(false)
         {
             base_betas.push(cli_internal.to_string());
         }
@@ -2229,56 +2268,116 @@ pub fn get_merged_betas(model: &str, is_agentic_query: bool) -> Vec<String> {
     base_betas
 }
 
+/// queryModel 的 betas 组装：`getMergedBetas` + advisor beta + 全局缓存 beta。
+pub fn build_query_betas(model: &str, is_agentic_query: bool, advisor_enabled: bool) -> Vec<String> {
+    let mut betas = get_merged_betas(model, is_agentic_query);
+    if advisor_enabled {
+        betas.push(ADVISOR_BETA_HEADER.to_string());
+    }
+    if should_use_global_cache_scope()
+        && !betas.contains(&PROMPT_CACHING_SCOPE_BETA_HEADER.to_string())
+    {
+        betas.push(PROMPT_CACHING_SCOPE_BETA_HEADER.to_string());
+    }
+    betas
+}
+
+/// `BetaHeaderLatches`：sticky-on beta header latch 的计算结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BetaHeaderLatches {
+    pub afk: bool,
+    pub fast_mode: bool,
+    pub cache_editing: bool,
+}
+
+/// queryModel 的 latch 逻辑：首次满足条件后写入 bootstrap state，之后
+/// 会话内持续发送（防止 mid-session 开关改变服务端缓存键、击穿 ~50-70K
+/// token 的缓存）。latches 由 `/clear` / `/compact` 清理。
+pub fn compute_beta_header_latches(
+    query_source: &str,
+    is_fast_mode: bool,
+    cached_mc_enabled: bool,
+    auto_mode_active: bool,
+) -> BetaHeaderLatches {
+    let mut afk = get_afk_mode_header_latched() == Some(true);
+    if feature("TRANSCRIPT_CLASSIFIER")
+        && !afk
+        && is_agentic_query_source(query_source)
+        && should_include_first_party_only_betas()
+        && auto_mode_active
+    {
+        afk = true;
+        set_afk_mode_header_latched(true);
+    }
+
+    let mut fast_mode = get_fast_mode_header_latched() == Some(true);
+    if !fast_mode && is_fast_mode {
+        fast_mode = true;
+        set_fast_mode_header_latched(true);
+    }
+
+    let mut cache_editing = get_cache_editing_header_latched() == Some(true);
+    if feature("CACHED_MICROCOMPACT")
+        && !cache_editing
+        && cached_mc_enabled
+        && get_api_provider() == ApiProvider::FirstParty
+        && query_source == "repl_main_thread"
+    {
+        cache_editing = true;
+        set_cache_editing_header_latched(true);
+    }
+
+    BetaHeaderLatches {
+        afk,
+        fast_mode,
+        cache_editing,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 模型字符串辅助（utils/model/model.ts 最小等价）
 // ---------------------------------------------------------------------------
 
+static STRIP_CONTEXT_TAG_RE: Lazy<Option<Regex>> = Lazy::new(|| Regex::new(r"\[(1|2)m\]").ok());
+
+static STRIP_DATE_RE: Lazy<Option<Regex>> = Lazy::new(|| Regex::new(r"-\d{8}").ok());
+
 /// `normalizeModelStringForAPI`：剥离 `[1m]` / `[2m]` 标记。
 pub fn normalize_model_string_for_api(model: &str) -> String {
-    regex_strip_context_tag
-        .replace_all(model, "")
-        .to_string()
+    match &*STRIP_CONTEXT_TAG_RE {
+        Some(re) => re.replace_all(model, "").to_string(),
+        None => model.to_string(),
+    }
 }
-
-static regex_strip_context_tag: once_cell::sync::Lazy<regex::Regex> =
-    once_cell::sync::Lazy::new(|| regex::Regex::new(r"\[(1|2)m\]").unwrap_or_else(|_| regex::Regex::new("").unwrap()));
 
 /// `getCanonicalName` 的最小等价：小写化 + 剥离 `-YYYYMMDD` 日期后缀。
 fn canonical_name(model: &str) -> String {
     let lower = model.to_ascii_lowercase();
-    let lower = regex_strip_date
-        .replace_all(&lower, "")
-        .to_string();
-    lower.trim().to_string()
+    match &*STRIP_DATE_RE {
+        Some(re) => re.replace_all(&lower, "").trim().to_string(),
+        None => lower,
+    }
 }
 
-static regex_strip_date: once_cell::sync::Lazy<regex::Regex> =
-    once_cell::sync::Lazy::new(|| regex::Regex::new(r"-\d{8}").unwrap_or_else(|_| regex::Regex::new("").unwrap()));
-
-fn model_string(key: ModelKey) -> &'static str {
+fn model_string(key: ModelKey) -> String {
     ALL_MODEL_CONFIGS
         .iter()
         .find(|(k, _)| *k == key)
-        .map(|(_, cfg)| cfg.for_provider(get_api_provider()))
-        .unwrap_or("")
+        .map(|(_, cfg)| cfg.for_provider(get_api_provider()).to_string())
+        .unwrap_or_default()
 }
 
 /// `getSmallFastModel`（最小等价：env 覆盖 → 默认 haiku）。
 pub fn get_small_fast_model() -> String {
-    match get_api_provider() {
-        ApiProvider::Openai => env::var("OPENAI_SMALL_FAST_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| model_string(ModelKey::Haiku45).to_string()),
-        ApiProvider::Gemini => env::var("GEMINI_SMALL_FAST_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| model_string(ModelKey::Haiku45).to_string()),
-        _ => env::var("ANTHROPIC_SMALL_FAST_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| model_string(ModelKey::Haiku45).to_string()),
-    }
+    let env_var = match get_api_provider() {
+        ApiProvider::Openai => "OPENAI_SMALL_FAST_MODEL",
+        ApiProvider::Gemini => "GEMINI_SMALL_FAST_MODEL",
+        _ => "ANTHROPIC_SMALL_FAST_MODEL",
+    };
+    env::var(env_var)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| model_string(ModelKey::Haiku45))
 }
 
 /// `getDefaultSonnetModel`（不含 3P primaryModel 回退）。
@@ -2288,10 +2387,10 @@ pub fn get_default_sonnet_model() -> String {
             return env_model;
         }
     }
-    if get_api_provider() != ApiProvider::FirstParty {
-        model_string(ModelKey::Sonnet45).to_string()
+    if get_api_provider() == ApiProvider::FirstParty {
+        model_string(ModelKey::Sonnet46)
     } else {
-        model_string(ModelKey::Sonnet46).to_string()
+        model_string(ModelKey::Sonnet45)
     }
 }
 
@@ -2302,7 +2401,7 @@ pub fn get_default_opus_model() -> String {
             return env_model;
         }
     }
-    model_string(ModelKey::Opus47).to_string()
+    model_string(ModelKey::Opus47)
 }
 
 /// `isNonCustomOpusModel`。
@@ -2315,10 +2414,11 @@ pub fn is_non_custom_opus_model(model: &str) -> bool {
         ModelKey::Opus47,
     ]
     .iter()
-    .any(|key| model == model_string(**key))
+    .any(|key| *model == model_string(**key))
 }
 
-/// 判断 querySource 为 agentic（`repl_main_thread*` / `agent:*` / sdk / hook / verification）。
+/// 判断 querySource 为 agentic（`repl_main_thread*` / `agent:*` /
+/// sdk / hook_agent / verification_agent）。
 pub fn is_agentic_query_source(query_source: &str) -> bool {
     query_source.starts_with("repl_main_thread")
         || query_source.starts_with("agent:")
@@ -2328,7 +2428,7 @@ pub fn is_agentic_query_source(query_source: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// fastMode / searchExtraTools 等未转换模块的最小判定
+// fastMode / LSP 等未转换模块的最小判定
 // ---------------------------------------------------------------------------
 
 /// `isFastModeEnabled`（utils/fastMode.ts 未转换 → 环境变量快速路径）。
@@ -2346,9 +2446,10 @@ pub fn is_fast_mode_cooldown() -> bool {
     false
 }
 
-/// `isFastModeSupportedByModel`（未转换 → 与 effort 支持判定一致）。
+/// `isFastModeSupportedByModel`（未转换 → opus-4-6/4-7 支持）。
 pub fn is_fast_mode_supported_by_model(model: &str) -> bool {
-    canonical_name(model).contains("opus-4-7") || canonical_name(model).contains("opus-4-6")
+    let canonical = canonical_name(model);
+    canonical.contains("opus-4-7") || canonical.contains("opus-4-6")
 }
 
 /// `shouldDeferLspTool`（LSP manager 未转换 → 不 defer）。
@@ -2379,7 +2480,7 @@ pub fn extract_sse_data(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 解析单个流式事件 JSON。
+/// 解析单个流式事件 JSON（`BetaRawMessageStreamEvent` 的 wire 形状）。
 pub fn parse_stream_event(json_str: &str) -> Result<BetaRawMessageStreamEvent, ApiError> {
     Ok(serde_json::from_str(json_str)?)
 }
@@ -2400,7 +2501,9 @@ pub struct StreamAccumulator {
     usage: NonNullableUsage,
     stop_reason: Option<String>,
     pub ttft_ms: i64,
-    advisor_in_progress: bool,
+    /// advisor server_tool_use 是否在途（TS 的 tengu_advisor_tool_interrupted 用）。
+    pub advisor_in_progress: bool,
+    /// message_delta 的最终 usage / stop_reason（调用方回写最后一条消息）。
     last_usage: Option<NonNullableUsage>,
     last_stop_reason: Option<String>,
 }
@@ -2411,7 +2514,7 @@ pub struct AccumulateContext<'a> {
     pub model: &'a str,
     pub request_id: Option<&'a str>,
     pub advisor_model: Option<&'a str>,
-    /// 用于成本累计与 stop_reason 回写。
+    /// 用于成本累计（`resolvedModel`：Bedrock inference profile 解析后的模型）。
     pub resolved_model: &'a str,
 }
 
@@ -2448,7 +2551,7 @@ impl StreamAccumulator {
         self.stop_reason.as_deref()
     }
 
-    /// message_delta 后最新的 usage / stop_reason（回写最后一条已产出消息）。
+    /// message_delta 后的最新 usage / stop_reason（回写最后一条已产出消息）。
     pub fn last_message_updates(&self) -> Option<(&NonNullableUsage, &str)> {
         match (&self.last_usage, &self.last_stop_reason) {
             (Some(u), Some(r)) => Some((u, r)),
@@ -2496,6 +2599,26 @@ impl StreamAccumulator {
                 Ok(StreamEventOutcome::Continue)
             }
             BetaRawMessageStreamEvent::ContentBlockDelta { index, delta } => {
+                // text_delta 只写 text_deltas（不触碰 block，避开与 block 的
+                // 可变借用冲突）；类型校验在下方统一完成。
+                if delta.typ == "text_delta" {
+                    if let Some(text) = delta.text() {
+                        self.text_deltas
+                            .entry(*index)
+                            .or_default()
+                            .push(text.to_string());
+                    }
+                    let block = self
+                        .get_block_mut(*index)
+                        .ok_or(ApiError::ContentBlockNotFound { index: *index })?;
+                    if block.typ != "text" {
+                        return Err(ApiError::ContentBlockTypeMismatch {
+                            expected: "text",
+                            actual: block.typ.clone(),
+                        });
+                    }
+                    return Ok(StreamEventOutcome::Continue);
+                }
                 let block = self
                     .get_block_mut(*index)
                     .ok_or(ApiError::ContentBlockNotFound { index: *index })?;
@@ -2511,17 +2634,6 @@ impl StreamAccumulator {
                             block.append_str("connector_text", text);
                         }
                     }
-                    "text_delta" => {
-                        if block.typ != "text" {
-                            return Err(ApiError::ContentBlockTypeMismatch {
-                                expected: "text",
-                                actual: block.typ.clone(),
-                            });
-                        }
-                        if let Some(text) = delta.text() {
-                            self.text_deltas.entry(*index).or_default().push(text.to_string());
-                        }
-                    }
                     "input_json_delta" => {
                         if block.typ != "tool_use" && block.typ != "server_tool_use" {
                             return Err(ApiError::ContentBlockTypeMismatch {
@@ -2529,15 +2641,11 @@ impl StreamAccumulator {
                                 actual: block.typ.clone(),
                             });
                         }
-                        if block.get_str("input").is_none() {
+                        let Some(input) = block.get_str("input").map(str::to_string) else {
                             return Err(ApiError::ContentBlockInputNotString);
-                        }
+                        };
                         if let Some(partial) = delta.partial_json() {
-                            if let Some(Value::String(input)) = block.fields.get("input") {
-                                let mut input = input.clone();
-                                input.push_str(partial);
-                                block.set_str("input", input);
-                            }
+                            block.set_str("input", format!("{input}{partial}"));
                         }
                     }
                     "thinking_delta" => {
@@ -2574,10 +2682,7 @@ impl StreamAccumulator {
                 Ok(StreamEventOutcome::Continue)
             }
             BetaRawMessageStreamEvent::ContentBlockStop { index } => {
-                let partial_message = self
-                    .partial_message
-                    .clone()
-                    .ok_or(ApiError::MessageNotFound)?;
+                let partial_message = self.partial_message.clone().ok_or(ApiError::MessageNotFound)?;
                 let block = self
                     .take_block(*index)
                     .ok_or(ApiError::ContentBlockNotFound { index: *index })?;
@@ -2639,7 +2744,9 @@ impl StreamAccumulator {
     /// 流结束校验：`message_start` 缺失或无内容块且无 stop_reason →
     /// `StreamNoEvents`（触发非流式回退的条件，对齐 TS 抛错点）。
     pub fn finish(&self, produced_messages: usize) -> Result<(), ApiError> {
-        if self.partial_message.is_none() || (produced_messages == 0 && self.stop_reason.is_none()) {
+        if self.partial_message.is_none()
+            || (produced_messages == 0 && self.stop_reason.is_none())
+        {
             Err(ApiError::StreamNoEvents)
         } else {
             Ok(())
@@ -2667,6 +2774,13 @@ impl StreamAccumulator {
     }
 }
 
+impl ContentBlockParam {
+    fn append_str(&mut self, key: &str, delta: &str) {
+        let prev = self.get_str(key).unwrap_or("").to_string();
+        self.set_str(key, format!("{prev}{delta}"));
+    }
+}
+
 fn add_to_total_session_cost(cost: f64, usage: &NonNullableUsage, model: &str) {
     let model_usage = ModelUsage {
         input_tokens: usage.input_tokens,
@@ -2678,7 +2792,7 @@ fn add_to_total_session_cost(cost: f64, usage: &NonNullableUsage, model: &str) {
         context_window: 0,
         max_output_tokens: 0,
     };
-    crate::bootstrap::state::add_to_total_cost_state(cost, model_usage, model);
+    add_to_total_cost_state(cost, model_usage, model);
 }
 
 fn cost_usage_from(usage: &NonNullableUsage) -> CostUsage {
@@ -2699,11 +2813,17 @@ fn usage_from_beta(usage: &BetaUsage) -> NonNullableUsage {
         cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
         output_tokens: usage.output_tokens,
         server_tool_use: usage.server_tool_use.clone().unwrap_or_default(),
-        service_tier: usage.service_tier.clone().unwrap_or_else(|| "standard".to_string()),
+        service_tier: usage
+            .service_tier
+            .clone()
+            .unwrap_or_else(|| "standard".to_string()),
         cache_creation: usage.cache_creation.clone().unwrap_or_default(),
         inference_geo: String::new(),
         iterations: Vec::new(),
-        speed: usage.speed.clone().unwrap_or_else(|| "standard".to_string()),
+        speed: usage
+            .speed
+            .clone()
+            .unwrap_or_else(|| "standard".to_string()),
         cache_deleted_input_tokens: usage
             .extra
             .get("cache_deleted_input_tokens")
@@ -2730,11 +2850,11 @@ fn normalize_block_for_app(block: &ContentBlockParam) -> Value {
     let mut value = serde_json::to_value(block).unwrap_or(Value::Null);
     if block.typ == "tool_use" || block.typ == "server_tool_use" {
         if let Value::Object(map) = &mut value {
-            if let Some(Value::String(input)) = map.get("input") {
+            if let Some(Value::String(input)) = map.get("input").cloned() {
                 let parsed = if input.is_empty() {
                     Value::Object(Map::new())
                 } else {
-                    serde_json::from_str(input).unwrap_or_else(|_| Value::Object(Map::new()))
+                    serde_json::from_str(&input).unwrap_or_else(|_| Value::Object(Map::new()))
                 };
                 map.insert("input".to_string(), parsed);
             }
@@ -2753,8 +2873,8 @@ fn utc_iso_now() -> String {
 
 /// `queryModel`：流式请求 + 重试 + 非流式回退的完整生成器。
 ///
-/// 需要 reqwest：创建 Anthropic 客户端、发送 streaming 请求、
-/// 与 withRetry / VCR / langfuse 集成。
+/// 需要 reqwest：创建 Anthropic 客户端、发送 streaming 请求、与
+/// withRetry / VCR / langfuse / quota 集成。
 pub async fn query_model(
     _messages: &[Message],
     _system_prompt: &SystemPrompt,
@@ -2785,7 +2905,27 @@ pub async fn query_model_without_streaming(
     _tools: &[ToolParam],
     _options: &Options,
 ) -> Result<AssistantMessage, ApiError> {
-    Err(ApiError::HttpClientUnavailable("query_model_without_streaming"))
+    Err(ApiError::HttpClientUnavailable(
+        "query_model_without_streaming",
+    ))
+}
+
+/// `executeNonStreamingRequest` 的客户端参数。
+#[derive(Debug, Clone)]
+pub struct NonStreamingClientOptions {
+    pub model: String,
+    pub source: String,
+}
+
+/// `executeNonStreamingRequest` 的重试参数。
+#[derive(Debug, Clone)]
+pub struct NonStreamingRetryOptions<'a> {
+    pub model: &'a str,
+    pub fallback_model: Option<&'a str>,
+    pub thinking_config: &'a ThinkingConfig,
+    pub fast_mode: bool,
+    pub initial_consecutive_529_errors: u32,
+    pub query_source: &'a QuerySource,
 }
 
 /// `executeNonStreamingRequest`：流式失败后的非流式重试请求。
@@ -2793,11 +2933,16 @@ pub async fn execute_non_streaming_request(
     _client_options: NonStreamingClientOptions,
     _retry_options: NonStreamingRetryOptions<'_>,
 ) -> Result<BetaMessage, ApiError> {
-    Err(ApiError::HttpClientUnavailable("execute_non_streaming_request"))
+    Err(ApiError::HttpClientUnavailable(
+        "execute_non_streaming_request",
+    ))
 }
 
 /// `verifyApiKey`：用 small fast model 发一次最小请求验证 API key。
-pub async fn verify_api_key(_api_key: &str, is_non_interactive_session: bool) -> Result<bool, ApiError> {
+pub async fn verify_api_key(
+    _api_key: &str,
+    is_non_interactive_session: bool,
+) -> Result<bool, ApiError> {
     if is_non_interactive_session {
         return Ok(true);
     }
@@ -2822,24 +2967,6 @@ pub async fn query_with_model(
     _options: &Options,
 ) -> Result<AssistantMessage, ApiError> {
     Err(ApiError::HttpClientUnavailable("query_with_model"))
-}
-
-/// `executeNonStreamingRequest` 的客户端参数。
-#[derive(Debug, Clone)]
-pub struct NonStreamingClientOptions {
-    pub model: String,
-    pub source: String,
-}
-
-/// `executeNonStreamingRequest` 的重试参数。
-#[derive(Debug, Clone)]
-pub struct NonStreamingRetryOptions<'a> {
-    pub model: &'a str,
-    pub fallback_model: Option<&'a str>,
-    pub thinking_config: &'a ThinkingConfig,
-    pub fast_mode: bool,
-    pub initial_consecutive_529_errors: u32,
-    pub query_source: &'a QuerySource,
 }
 
 #[cfg(test)]
@@ -2872,7 +2999,9 @@ mod tests {
             betas: None,
             metadata: None,
             max_tokens: 100_000,
-            thinking: Some(ThinkingParam::Enabled { budget_tokens: 90_000 }),
+            thinking: Some(ThinkingParam::Enabled {
+                budget_tokens: 90_000,
+            }),
             temperature: None,
             context_management: None,
             output_config: None,
@@ -2907,6 +3036,12 @@ mod tests {
             }
             _ => panic!("expected message_start"),
         }
+    }
+
+    #[test]
+    fn strip_context_tag_and_date() {
+        assert_eq!(normalize_model_string_for_api("claude-sonnet-4-5[1m]"), "claude-sonnet-4-5");
+        assert_eq!(canonical_name("claude-sonnet-4-20250514"), "claude-sonnet-4-");
     }
 
     #[test]
