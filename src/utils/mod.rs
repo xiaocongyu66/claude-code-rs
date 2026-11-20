@@ -78,3 +78,5 @@ pub mod cache_paths;
 pub mod errors;
 pub mod fs_operations;
 pub mod bash;
+pub mod debug;
+pub mod slow_operations;
