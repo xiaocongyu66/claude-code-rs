@@ -612,6 +612,11 @@ impl<'a> ParseState<'a> {
         self.lex.peek_off(2)
     }
 
+    /// TS 端 peek(L, off) 的通用形式
+    fn peek_off(&self, off: usize) -> Option<char> {
+        self.lex.peek_off(off)
+    }
+
     fn advance(&mut self) {
         self.lex.advance();
     }
@@ -695,8 +700,9 @@ impl<'a> ParseState<'a> {
             }
             self.restore(save);
             let stmts = self.parse_statements(None)?;
+            let stmts_empty = stmts.is_empty();
             children.extend(stmts);
-            if stmts.is_empty() {
+            if stmts_empty {
                 // 无法解析——产出 ERROR 并跳过一个 token
                 let err_tok = self.next_token(Ctx::Cmd);
                 if err_tok.kind == TokenKind::Eof {
@@ -853,10 +859,11 @@ impl<'a> ParseState<'a> {
                 if next.node_type == "redirected_statement" && next.children.len() >= 2 {
                     let mut redirs = next.children;
                     let inner = redirs.remove(0);
+                    let inner_end = inner.end_index;
                     parts.push(op);
                     parts.push(inner);
                     let pipe_node =
-                        self.mk("pipeline", parts[0].start_index, inner.end_index, parts.clone())?;
+                        self.mk("pipeline", parts[0].start_index, inner_end, parts.clone())?;
                     let last_end = redirs[redirs.len() - 1].end_index;
                     let mut kids = vec![pipe_node];
                     kids.extend(redirs);
@@ -1018,16 +1025,30 @@ impl<'a> ParseState<'a> {
 
         if t.kind == TokenKind::Word {
             match t.value {
-                "if" => return self.maybe_redirect(self.parse_if(&t)?, true).map(Some),
-                "while" | "until" => return self.maybe_redirect(self.parse_while(&t)?, true).map(Some),
-                "for" | "select" => return self.maybe_redirect(self.parse_for(&t)?, true).map(Some),
-                "case" => return self.maybe_redirect(self.parse_case(&t)?, true).map(Some),
+                "if" => {
+                    let node = self.parse_if(&t)?;
+                    return self.maybe_redirect(node, true).map(Some);
+                }
+                "while" | "until" => {
+                    let node = self.parse_while(&t)?;
+                    return self.maybe_redirect(node, true).map(Some);
+                }
+                "for" | "select" => {
+                    let node = self.parse_for(&t)?;
+                    return self.maybe_redirect(node, true).map(Some);
+                }
+                "case" => {
+                    let node = self.parse_case(&t)?;
+                    return self.maybe_redirect(node, true).map(Some);
+                }
                 "function" => return Ok(Some(self.parse_function(&t)?)),
                 _ if is_decl_keyword(t.value) => {
-                    return self.maybe_redirect(self.parse_declaration(&t)?, false).map(Some)
+                    let node = self.parse_declaration(&t)?;
+                    return self.maybe_redirect(node, false).map(Some);
                 }
                 "unset" | "unsetenv" => {
-                    return self.maybe_redirect(self.parse_unset(&t)?, false).map(Some)
+                    let node = self.parse_unset(&t)?;
+                    return self.maybe_redirect(node, false).map(Some);
                 }
                 _ => {}
             }
@@ -1331,8 +1352,8 @@ impl<'a> ParseState<'a> {
         if self.peek() == Some('[') {
             self.advance();
             let mut depth = 1;
-            while self.lex.i < self.src().len() && depth > 0 {
-                let c = self.peek().unwrap();
+            while depth > 0 {
+                let Some(c) = self.peek() else { break };
                 if c == '[' {
                     depth += 1;
                 } else if c == ']' {
@@ -1576,8 +1597,15 @@ impl<'a> ParseState<'a> {
             if dc == Some('\'') || dc == Some('"') {
                 quoted = true;
                 self.advance();
-                while self.lex.i < self.src().len() && self.peek() != dc {
-                    delim.push(self.peek().unwrap());
+                while self.lex.i < self.src().len() {
+                    let ch = match self.peek() {
+                        Some(ch) => ch,
+                        None => break,
+                    };
+                    if Some(ch) == dc {
+                        break;
+                    }
+                    delim.push(ch);
                     self.advance();
                 }
                 if self.lex.i < self.src().len() {
@@ -1588,18 +1616,26 @@ impl<'a> ParseState<'a> {
                 quoted = true;
                 self.advance();
                 if self.lex.i < self.src().len() && self.peek() != Some('\n') {
-                    delim.push(self.peek().unwrap());
+                    if let Some(ch) = self.peek() {
+                        delim.push(ch);
+                    }
                     self.advance();
                 }
                 // 后面可能还有标识符字符（如 <<\EOF → EOF）
-                while matches!(self.peek(), Some(c) if is_ident_char(c)) {
-                    delim.push(self.peek().unwrap());
+                while let Some(ch) = self.peek() {
+                    if !is_ident_char(ch) {
+                        break;
+                    }
+                    delim.push(ch);
                     self.advance();
                 }
             } else {
                 // 非引号定界符：bash 接受大多数非元字符
-                while matches!(self.peek(), Some(c) if is_heredoc_delim_char(c)) {
-                    delim.push(self.peek().unwrap());
+                while let Some(ch) = self.peek() {
+                    if !is_heredoc_delim_char(ch) {
+                        break;
+                    }
+                    delim.push(ch);
                     self.advance();
                 }
             }
@@ -1615,6 +1651,7 @@ impl<'a> ParseState<'a> {
                 end_start: 0,
                 end_end: 0,
             });
+            let op_start = op.start_index;
             let mut kids = vec![op, start_node];
             let start_idx;
             if let Some(fd) = fd {
@@ -1623,7 +1660,7 @@ impl<'a> ParseState<'a> {
                 k.extend(kids);
                 kids = k;
             } else {
-                start_idx = op.start_index;
+                start_idx = op_start;
             }
             // tree-sitter 把 heredoc_start 与换行之间的流水线/list/file_redirect
             // 嵌套为 heredoc_redirect 的子节点——必须正确解析，不能静默丢弃
@@ -1782,11 +1819,10 @@ impl<'a> ParseState<'a> {
     }
 
     fn parse_process_sub(&mut self) -> PResult<Option<TsNode>> {
-        let c = self.peek();
-        if !matches!(c, Some('<') | Some('>')) || self.peek1() != Some('(') {
+        let Some(c) = self.peek() else { return Ok(None) };
+        if !matches!(c, '<' | '>') || self.peek1() != Some('(') {
             return Ok(None);
         }
-        let c = c.unwrap();
         let start = self.lex.i;
         self.advance();
         self.advance();
@@ -2299,7 +2335,7 @@ impl<'a> ParseState<'a> {
         content_start: usize,
     ) -> PResult<()> {
         if self.lex.i > content_start {
-            let txt = self.src()[content_start..self.lex.i];
+            let txt = &self.src()[content_start..self.lex.i];
             if !is_blank_text(txt) {
                 parts.push(self.mk("string_content", content_start, self.lex.i, vec![])?);
             }
@@ -2470,15 +2506,14 @@ impl<'a> ParseState<'a> {
         }
         // 可选 ! = ~ 前缀（间接展开 / zsh 风格）——仅后跟标识符或数字时
         let pc = self.peek();
-        if matches!(pc, Some('!') | Some('=') | Some('~'))
-            && matches!(
-                self.peek1(),
-                Some(c) if is_ident_start(c) || is_digit(c)
-            )
-        {
-            let s = self.lex.i;
-            self.advance();
-            out.push(self.mk_char(pc.unwrap(), s, self.lex.i, vec![])?);
+        if let Some(pc) = pc {
+            if matches!(pc, '!' | '=' | '~')
+                && matches!(self.peek1(), Some(c) if is_ident_start(c) || is_digit(c))
+            {
+                let s = self.lex.i;
+                self.advance();
+                out.push(self.mk_char(pc, s, self.lex.i, vec![])?);
+            }
         }
         self.skip_blanks();
         // 变量名
@@ -2528,11 +2563,13 @@ impl<'a> ParseState<'a> {
         self.skip_blanks();
         // 尾随 * 或 @（间接展开 / 参数变换）
         let tc = self.peek();
-        if matches!(tc, Some('*') | Some('@')) && self.peek1() == Some('}') {
-            let s = self.lex.i;
-            self.advance();
-            out.push(self.mk_char(tc.unwrap(), s, self.lex.i, vec![])?);
-            return Ok(out);
+        if let Some(tc) = tc {
+            if matches!(tc, '*' | '@') && self.peek1() == Some('}') {
+                let s = self.lex.i;
+                self.advance();
+                out.push(self.mk_char(tc, s, self.lex.i, vec![])?);
+                return Ok(out);
+            }
         }
         if tc == Some('@') && matches!(self.peek1(), Some(c) if is_ident_start(c)) {
             // ${var@U} 变换——@ 是匿名节点
@@ -2599,11 +2636,10 @@ impl<'a> ParseState<'a> {
                 return Ok(out);
             }
         }
-        if matches!(
-            c,
-            Some(':') | Some('#') | Some('%') | Some('/') | Some('^') | Some(',') | Some('-') | Some('=') | Some('?') | Some('+')
-        ) {
-            let c = c.unwrap();
+        if let Some(c) = c {
+            if !matches!(c, ':' | '#' | '%' | '/' | '^' | ',' | '-' | '=' | '?' | '+') {
+                return Ok(out);
+            }
             let s = self.lex.i;
             let c1 = self.peek1();
             let mut op = String::new();
@@ -2611,7 +2647,9 @@ impl<'a> ParseState<'a> {
             if c == ':' && matches!(c1, Some('-') | Some('=') | Some('?') | Some('+')) {
                 self.advance();
                 self.advance();
-                op.push(c1.unwrap());
+                if let Some(c1) = c1 {
+                    op.push(c1);
+                }
             } else if matches!(c, '#' | '%' | '/' | '^' | ',') && c1 == Some(c) {
                 // 双写算符
                 self.advance();
@@ -2627,11 +2665,12 @@ impl<'a> ParseState<'a> {
             );
             if op == "/" || op == "//" {
                 // 可选 /# 或 /% 锚点前缀
-                let ac = self.peek();
-                if matches!(ac, Some('#') | Some('%')) {
-                    let a_start = self.lex.i;
-                    self.advance();
-                    out.push(self.mk_char(ac.unwrap(), a_start, self.lex.i, vec![])?);
+                if let Some(ac) = self.peek() {
+                    if matches!(ac, '#' | '%') {
+                        let a_start = self.lex.i;
+                        self.advance();
+                        out.push(self.mk_char(ac, a_start, self.lex.i, vec![])?);
+                    }
                 }
                 // 替换左侧模式
                 if self.peek() == Some('"') {
@@ -2769,8 +2808,8 @@ impl<'a> ParseState<'a> {
                         self.advance();
                         self.advance();
                         d += 1;
-                        while self.lex.i < self.src().len() && d > 0 {
-                            let nc = self.peek().unwrap();
+                        while d > 0 {
+                            let Some(nc) = self.peek() else { break };
                             if nc == '{' {
                                 d += 1;
                             } else if nc == '}' {
@@ -2785,8 +2824,8 @@ impl<'a> ParseState<'a> {
                         self.advance();
                         self.advance();
                         d += 1;
-                        while self.lex.i < self.src().len() && d > 0 {
-                            let nc = self.peek().unwrap();
+                        while d > 0 {
+                            let Some(nc) = self.peek() else { break };
                             if nc == '(' {
                                 d += 1;
                             } else if nc == ')' {
@@ -3014,8 +3053,8 @@ impl<'a> ParseState<'a> {
                     let mut d = 1;
                     self.advance();
                     self.advance();
-                    while self.lex.i < self.src().len() && d > 0 {
-                        let nc = self.peek().unwrap();
+                    while d > 0 {
+                        let Some(nc) = self.peek() else { break };
                         if nc == '{' {
                             d += 1;
                         } else if nc == '}' {
@@ -3029,8 +3068,8 @@ impl<'a> ParseState<'a> {
                     let mut d = 1;
                     self.advance();
                     self.advance();
-                    while self.lex.i < self.src().len() && d > 0 {
-                        let nc = self.peek().unwrap();
+                    while d > 0 {
+                        let Some(nc) = self.peek() else { break };
                         if nc == '(' {
                             d += 1;
                         } else if nc == ')' {
@@ -3519,7 +3558,7 @@ impl<'a> ParseState<'a> {
             }
             if c == '"' {
                 if self.lex.i > seg_start {
-                    let t = self.src()[seg_start..self.lex.i];
+                    let t = &self.src()[seg_start..self.lex.i];
                     let ty = if has_glob_meta(t) { "extglob_pattern" } else { "word" };
                     parts.push(self.mk(ty, seg_start, self.lex.i, vec![])?);
                 }
@@ -3529,7 +3568,7 @@ impl<'a> ParseState<'a> {
             }
             if c == '\'' {
                 if self.lex.i > seg_start {
-                    let t = self.src()[seg_start..self.lex.i];
+                    let t = &self.src()[seg_start..self.lex.i];
                     let ty = if has_glob_meta(t) { "extglob_pattern" } else { "word" };
                     parts.push(self.mk(ty, seg_start, self.lex.i, vec![])?);
                 }
@@ -3544,7 +3583,7 @@ impl<'a> ParseState<'a> {
             self.advance();
         }
         if self.lex.i > seg_start {
-            let t = self.src()[seg_start..self.lex.i];
+            let t = &self.src()[seg_start..self.lex.i];
             let ty = if has_glob_meta(t) { "extglob_pattern" } else { "word" };
             parts.push(self.mk(ty, seg_start, self.lex.i, vec![])?);
         }
@@ -3693,7 +3732,7 @@ impl<'a> ParseState<'a> {
                     self.restore(save);
                     break;
                 };
-                let l = left.take().unwrap();
+                let Some(l) = left.take() else { return Ok(None) };
                 left = Some(self.mk("binary_expression", l.start_index, right.end_index, vec![l, op, right])?);
             } else {
                 break;
@@ -3716,7 +3755,7 @@ impl<'a> ParseState<'a> {
                 let op = self.mk("&&", s, self.lex.i, vec![])?;
                 let right = self.parse_test_unary(closer)?;
                 let Some(right) = right else { break };
-                let l = left.take().unwrap();
+                let Some(l) = left.take() else { return Ok(None) };
                 left = Some(self.mk("binary_expression", l.start_index, right.end_index, vec![l, op, right])?);
             } else {
                 break;
@@ -3991,7 +4030,7 @@ impl<'a> ParseState<'a> {
                     || matches!(c1, Some(c) if is_special_var(c))
                 {
                     if self.lex.i > seg_start {
-                        let t = self.src()[seg_start..self.lex.i];
+                        let t = &self.src()[seg_start..self.lex.i];
                         let ty = if is_digits_text(t) { "number" } else { "extglob_pattern" };
                         parts.push(self.mk(ty, seg_start, self.lex.i, vec![])?);
                     }
@@ -4005,7 +4044,7 @@ impl<'a> ParseState<'a> {
             }
             if c == '"' {
                 if self.lex.i > seg_start {
-                    let t = self.src()][seg_start..self.lex.i];
+                    let t = &self.src()[seg_start..self.lex.i];
                     let ty = if is_digits_text(t) { "number" } else { "extglob_pattern" };
                     parts.push(self.mk(ty, seg_start, self.lex.i, vec![])?);
                 }
@@ -4015,7 +4054,7 @@ impl<'a> ParseState<'a> {
             }
             if c == '\'' {
                 if self.lex.i > seg_start {
-                    let t = self.src()[seg_start..self.lex.i];
+                    let t = &self.src()[seg_start..self.lex.i];
                     let ty = if is_digits_text(t) { "number" } else { "extglob_pattern" };
                     parts.push(self.mk(ty, seg_start, self.lex.i, vec![])?);
                 }
@@ -4032,7 +4071,7 @@ impl<'a> ParseState<'a> {
             self.advance();
         }
         if self.lex.i > seg_start {
-            let t = self.src()[seg_start..self.lex.i];
+            let t = &self.src()[seg_start..self.lex.i];
             let ty = if is_digits_text(t) { "number" } else { "extglob_pattern" };
             parts.push(self.mk(ty, seg_start, self.lex.i, vec![])?);
         }
@@ -4179,7 +4218,7 @@ impl<'a> ParseState<'a> {
             let next_min = if is_arith_right_assoc(op_text) { prec } else { prec + 1 };
             let right = self.parse_arith_binary(stop, next_min, mode)?;
             let Some(right) = right else { break };
-            let l = left.take().unwrap();
+            let Some(l) = left.take() else { return Ok(None) };
             left = Some(self.mk("binary_expression", l.start_index, right.end_index, vec![l, op, right])?);
         }
         Ok(left)
@@ -4206,8 +4245,10 @@ impl<'a> ParseState<'a> {
             let Some(inner) = inner else { return Ok(Some(op)) };
             return Ok(Some(self.mk("unary_expression", op.start_index, inner.end_index, vec![op, inner])?));
         }
-        if matches!(c, Some('-') | Some('+') | Some('!') | Some('~')) {
-            let c = c.unwrap();
+        if let Some(c) = c {
+            if !matches!(c, '-' | '+' | '!' | '~') {
+                return self.parse_arith_postfix(stop, mode);
+            }
             // word/assign 模式（c 风格 for 头）中 `-N` 是单个数字字面量
             if mode != ArithMode::Var && c == '-' && matches!(c1, Some(c) if is_digit(c)) {
                 let s = self.lex.i;

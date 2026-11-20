@@ -76,3 +76,5 @@ pub mod settings;
 pub mod shell;
 pub mod cache_paths;
 pub mod errors;
+pub mod fs_operations;
+pub mod bash;
