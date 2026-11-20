@@ -1330,7 +1330,8 @@ mod tests {
         // 5 行，第二行含多字节 UTF-8 字符
         write_test_file(&path, "one\ntwó\nthree\nfour\nfive");
         let r = read_file_range(&path, 4, 100).unwrap().unwrap();
-        assert_eq!(&r.content, "\ntwó\nthree\nfour\nfive");
+        // offset 4 按字节落在第二行的 't' 上（"one\n" 恰好 4 字节）
+        assert_eq!(&r.content, "twó\nthree\nfour\nfive");
         assert_eq!(r.bytes_total, 24);
 
         let t = tail_file(&path, 10).unwrap();
