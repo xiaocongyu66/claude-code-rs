@@ -623,7 +623,6 @@ pub struct ConnectedMCPServer {
     pub client: McpClientRef,
     pub name: String,
     pub capabilities: ServerCapabilities,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub server_info: Option<ServerInfo>,
     pub instructions: Option<String>,
     pub health: Option<MCPServerHealth>,

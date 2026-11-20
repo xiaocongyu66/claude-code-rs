@@ -463,13 +463,14 @@ fn get_version_base(version: &str) -> Option<String> {
 /// 构建环境上下文（偏差：env.ts 检测能力未转换，保守填充）。
 fn build_env_context() -> EnvContext {
     let platform = match get_platform() {
-        Platform::MacOS => "darwin",
+        Platform::Macos => "darwin",
         Platform::Windows => "win32",
         _ => "linux",
     };
     let platform_raw = std::env::var("CLAUDE_CODE_HOST_PLATFORM")
+        .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|_| std::env::consts::OS.to_string());
+        .unwrap_or_else(|| std::env::consts::OS.to_string());
     EnvContext {
         platform: platform.to_string(),
         platform_raw,
@@ -755,7 +756,7 @@ pub fn to_1p_event_format(
     // 可选环境字段（对齐 TS 的条件展开序列）
     macro_rules! env_opt_str {
         ($key:expr, $field:expr) => {
-            if let Some(value) = $field {
+            if let Some(value) = &$field {
                 env.insert($key.into(), Value::String(value.clone()));
             }
         };

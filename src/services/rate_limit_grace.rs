@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
@@ -129,8 +129,9 @@ pub struct GraceZone {
     pub extra_usage_status: Option<ExtraUsageStatus>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GraceTurnNoteState {
+    #[default]
     None,
     Owed,
     Taken,

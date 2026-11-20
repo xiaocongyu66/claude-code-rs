@@ -199,7 +199,7 @@ impl UseManageMcpConnections {
         gate_channel_server(
             server_name,
             Some(capabilities),
-            config.and_then(|c| c.plugin_source.as_deref()),
+            config.as_ref().and_then(|c| c.plugin_source.as_deref()),
         )
     }
 

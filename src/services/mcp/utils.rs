@@ -96,10 +96,10 @@ pub fn filter_mcp_prompts_by_server<'a>(
 }
 
 /// 按服务器过滤资源（`resource.server === serverName`）。
-pub fn filter_resources_by_server(
-    resources: &[crate::services::mcp::types::ServerResource],
+pub fn filter_resources_by_server<'a>(
+    resources: &'a [crate::services::mcp::types::ServerResource],
     server_name: &str,
-) -> Vec<&crate::services::mcp::types::ServerResource> {
+) -> Vec<&'a crate::services::mcp::types::ServerResource> {
     resources
         .iter()
         .filter(|r| r.server == server_name)
@@ -107,7 +107,7 @@ pub fn filter_resources_by_server(
 }
 
 /// 排除属于某服务器的工具（名称前缀匹配，返回新 Vec）。
-pub fn exclude_tools_by_server<T, F>(tools: &[T], name_of: F, server_name: &str) -> Vec<&T>
+pub fn exclude_tools_by_server<'a, T, F>(tools: &'a [T], name_of: F, server_name: &str) -> Vec<&'a T>
 where
     F: Fn(&T) -> Option<&str>,
 {
@@ -119,10 +119,10 @@ where
 }
 
 /// 排除属于某服务器的命令。
-pub fn exclude_commands_by_server(
-    commands: &[CommandLike],
+pub fn exclude_commands_by_server<'a>(
+    commands: &'a [CommandLike],
     server_name: &str,
-) -> Vec<&CommandLike> {
+) -> Vec<&'a CommandLike> {
     commands
         .iter()
         .filter(|c| !command_belongs_to_server(c, server_name))
@@ -420,7 +420,9 @@ pub fn extract_agent_mcp_servers(agents: &[Value]) -> Vec<AgentMcpServerInfo> {
             if obj.len() != 1 {
                 continue;
             }
-            let (server_name, server_config) = obj.iter().next().unwrap_or_else(|| ("", &Value::Null));
+            let Some((server_name, server_config)) = obj.iter().next() else {
+                continue;
+            };
             if server_name.is_empty() {
                 continue;
             }

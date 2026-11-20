@@ -357,6 +357,15 @@ pub struct ToolUseContext {
     pub rendered_system_prompt: Option<SystemPrompt>,
 }
 
+/// 回调字段无法派生 `Debug`，这里给出不含字段内容的占位实现（仅用于
+/// 携带 `ToolUseContext` 的结构体派生 `Debug`，如 compact 的
+/// `CacheSafeParams`）。
+impl std::fmt::Debug for ToolUseContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolUseContext").finish_non_exhaustive()
+    }
+}
+
 // ============================================================================
 // 进度类型
 // ============================================================================

@@ -10,6 +10,8 @@
 
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 use crate::services::compact::compact::{annotate_boundary_with_preserved_segment, CompactionResult};
 use crate::services::compact::micro_compact::estimate_message_tokens;
 use crate::services::compact::prompt::get_compact_user_summary_message;
@@ -17,7 +19,7 @@ use crate::services::compact::{create_compact_boundary_message, create_user_mess
 use crate::utils::env_utils::is_env_truthy;
 
 /// TS `SessionMemoryCompactConfig`。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMemoryCompactConfig {
     /// 压缩后最少保留的 token 数。
     pub min_tokens: usize,
@@ -431,6 +433,7 @@ fn create_compaction_result_from_session_memory(
         summary_messages,
         attachments: Vec::new(),
         hook_results: hook_results.to_vec(),
+        user_display_message: None,
         messages_to_keep: Some(messages_to_keep.to_vec()),
         pre_compact_token_count: Some(pre_compact_token_count),
         post_compact_token_count: Some(keep_estimate),

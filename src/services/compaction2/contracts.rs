@@ -142,7 +142,7 @@ pub struct CompactionContext {
     /// 规范上下文大小估算；与 legacy 路径同一函数。
     pub token_count: Box<dyn Fn(&[Message]) -> i64 + Send + Sync>,
     pub estimate_entry_tokens: Box<dyn Fn(&EntryView) -> i64 + Send + Sync>,
-    pub abort_signal: Option<AbortSignalRef>,
+    pub abort_signal: Option<Box<dyn AbortSignalRef>>,
     pub agent_id: Option<String>,
     pub now: Box<dyn Fn() -> i64 + Send + Sync>,
 }

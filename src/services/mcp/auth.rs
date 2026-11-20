@@ -1827,6 +1827,7 @@ async fn wait_for_callback(
 
     let (code_tx, mut code_rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
     let expected_state = expected_state.to_string();
+    let expected_state_for_server = expected_state.clone();
 
     // 回调 HTTP 服务器循环
     let code_tx_for_server = code_tx.clone();
@@ -1868,7 +1869,7 @@ async fn wait_for_callback(
             let state = params.get("state").cloned();
 
             // state 校验（CSRF 防护）
-            if error.is_none() && state.as_deref() != Some(&expected_state) {
+            if error.is_none() && state.as_deref() != Some(&expected_state_for_server) {
                 let _ = respond(
                     &mut stream,
                     400,
@@ -2050,7 +2051,7 @@ pub fn clear_mcp_client_config(server_name: &str, config: &McpServerConfig) {
     }
 }
 
-fn get_mcp_client_config_by_key(server_key: &str) -> Option<McpClientConfigEntry> {
+pub fn get_mcp_client_config_by_key(server_key: &str) -> Option<McpClientConfigEntry> {
     get_secure_storage().mcp_oauth_client_config.get(server_key).cloned()
 }
 

@@ -1119,14 +1119,14 @@ pub fn parse_mcp_config_from_file_path(
             let fatal = ValidationError {
                 file: Some(file_path.to_string()),
                 path: String::new(),
-                message: if is_enoent(&*error) {
+                message: if is_enoent(&error) {
                     format!("MCP config file not found: {file_path}")
                 } else {
                     format!("Failed to read file: {error}")
                 },
                 expected: None,
                 invalid_value: None,
-                suggestion: Some(if is_enoent(&*error) {
+                suggestion: Some(if is_enoent(&error) {
                     "Check that the file path is correct".to_string()
                 } else {
                     "Check file permissions and ensure the file exists".to_string()
@@ -1142,7 +1142,7 @@ pub fn parse_mcp_config_from_file_path(
         }
     };
 
-    let content_string = String::from_utf8_lossy(&config_content);
+    let content_string = String::from_utf8_lossy(config_content.as_bytes());
     let parsed_json = crate::utils::slow_operations::json_parse(content_string.trim_start_matches('\u{feff}'));
     let parsed_json = match parsed_json {
         Ok(value) => value,
@@ -1353,7 +1353,7 @@ pub fn get_current_project_config() -> Value {
     project
 }
 
-fn update_global_config(updater: impl Fn(&Value) -> Value) {
+pub fn update_global_config(updater: impl Fn(&Value) -> Value) {
     let current = get_global_config();
     let updated = updater(&current);
     let path = global_config_path();

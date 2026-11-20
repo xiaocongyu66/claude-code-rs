@@ -45,7 +45,7 @@ const ID_AVOID_SUBSTRINGS: &[&str] = &[
 ];
 
 /// 权限回复（TS `ChannelPermissionResponse`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelPermissionResponse {
     pub behavior: ChannelPermissionBehavior,
     /// 回复来源服务器（如 "plugin:telegram:tg"）。
@@ -113,10 +113,10 @@ pub trait ChannelClient {
 
 /// 过滤可中继权限提示的客户端：connected + 在 allowlist + 同时声明两项
 /// 能力。`is_in_allowlist` 由调用方提供（channel 门控结果）。
-pub fn filter_permission_relay_clients<C: ChannelClient>(
-    clients: &[C],
-    is_in_allowlist: &dyn Fn(&str) -> bool,
-) -> Vec<&C> {
+pub fn filter_permission_relay_clients<'a, C: ChannelClient>(
+    clients: &'a [C],
+    is_in_allowlist: &'a dyn Fn(&str) -> bool,
+) -> Vec<&'a C> {
     clients
         .iter()
         .filter(|c| {

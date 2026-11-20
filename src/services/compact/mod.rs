@@ -313,13 +313,16 @@ pub fn now_ts() -> String {
 
 /// TS `createUserMessage({ content, isMeta?, isCompactSummary?,
 /// isVisibleInTranscriptOnly? })`。
+/// TS `createUserMessage({ content, isMeta?, isCompactSummary?,
+/// isVisibleInTranscriptOnly? })`。返回内层 `UserMessage`，需要完整
+/// `Message` 的调用侧自行 `Message::User(...)` 包裹。
 pub fn create_user_message(
     content: &str,
     is_meta: bool,
     is_compact_summary: bool,
     is_visible_in_transcript_only: bool,
-) -> Message {
-    Message::User(UserMessage {
+) -> UserMessage {
+    UserMessage {
         uuid: uuid_v4(),
         timestamp: now_ts(),
         message: UserMessageBody {
@@ -336,7 +339,7 @@ pub fn create_user_message(
         parent_uuid: None,
         tool_use_result: None,
         summarize_metadata: None,
-    })
+    }
 }
 
 /// TS `createCompactBoundaryMessage(trigger, preTokens, lastPreCompactUuid?,

@@ -273,7 +273,12 @@ pub fn truncate_head_for_ptl_retry(
     // role=user）；补一个合成 user 标记（配对的孤立 tool_result 由
     // ensureToolResultPairing 兜底）。
     if sliced.first().map(|m| m.typ()) == Some("assistant") {
-        let mut result = vec![create_user_message(PTL_RETRY_MARKER, true, false, false)];
+        let mut result = vec![Message::User(create_user_message(
+            PTL_RETRY_MARKER,
+            true,
+            false,
+            false,
+        ))];
         result.extend(sliced);
         return Some(result);
     }
@@ -486,7 +491,7 @@ async fn compact_conversation_inner(
         )
         .await
     };
-    custom_instructions = merge_hook_instructions(
+    let custom_instructions = merge_hook_instructions(
         custom_instructions,
         hook_result.new_custom_instructions.as_deref(),
     );
@@ -500,8 +505,8 @@ async fn compact_conversation_inner(
         Some(Value::Bool(false))
     ) == false;
 
-    let compact_prompt = get_compact_prompt(custom_instructions);
-    let summary_request = create_user_message(&compact_prompt, false, false, false);
+    let compact_prompt = get_compact_prompt(custom_instructions.as_deref());
+    let summary_request = Message::User(create_user_message(&compact_prompt, false, false, false));
 
     let mut messages_to_summarize = messages.clone();
     let mut retry_cache_safe_params = _cache_safe_params.clone();
@@ -795,7 +800,7 @@ pub async fn partial_compact_conversation(
     };
 
     let compact_prompt = get_partial_compact_prompt(custom_instructions.as_deref(), direction);
-    let summary_request = create_user_message(&compact_prompt, false, false, false);
+    let summary_request = Message::User(create_user_message(&compact_prompt, false, false, false));
 
     // 'up_to' prefix 直接命中缓存；'from' 发全量（tail 不会缓存）。
     let mut api_messages: Vec<Message> = match direction {
@@ -1093,7 +1098,11 @@ fn to_api_message(message: &Message) -> crate::services::api::claude::Message {
                 message: AssistantMessageBody {
                     content: to_api_content(&assistant.message.content),
                     model: assistant.message.model.clone(),
-                    usage: assistant.message.usage.clone(),
+                    usage: assistant
+                        .message
+                        .usage
+                        .as_ref()
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
                     stop_reason: assistant.message.stop_reason.clone(),
                 },
                 request_id: assistant.request_id.clone(),
@@ -1118,10 +1127,12 @@ fn to_api_message(message: &Message) -> crate::services::api::claude::Message {
     }
 }
 
-fn to_api_content(content: &Content) -> MessageContent {
+fn to_api_content(content: &Content) -> crate::services::api::claude::MessageContent {
     match content {
-        Content::Text(text) => MessageContent::Text(text.clone()),
-        Content::Blocks(blocks) => MessageContent::Blocks(blocks.clone()),
+        Content::Text(text) => crate::services::api::claude::MessageContent::Text(text.clone()),
+        Content::Blocks(blocks) => {
+            crate::services::api::claude::MessageContent::Blocks(blocks.clone())
+        }
     }
 }
 
@@ -1139,7 +1150,11 @@ fn from_api_assistant(assistant: &crate::services::api::claude::AssistantMessage
                 }
             },
             model: assistant.message.model.clone(),
-            usage: assistant.message.usage.clone(),
+            usage: assistant
+                .message
+                .usage
+                .as_ref()
+                .map(|u| serde_json::to_value(u).unwrap_or_default()),
             stop_reason: assistant.message.stop_reason.clone(),
         },
         is_api_error_message: None,
@@ -1150,7 +1165,11 @@ fn from_api_assistant(assistant: &crate::services::api::claude::AssistantMessage
 fn stream_compact_options() -> crate::services::api::claude::Options {
     // 与 TS 对齐的压缩请求选项；isNonInteractiveSession/effortValue 等
     // 来自 ToolUseContext（本次调用暂占位）。
-    let model = crate::utils::model::model::get_runtime_main_loop_model();
+    let model = crate::utils::model::model::get_runtime_main_loop_model(
+        crate::types::permissions::PermissionMode::Default,
+        &crate::utils::model::model::get_default_main_loop_model(),
+        false,
+    );
     crate::services::api::claude::Options {
         model: model.clone(),
         tool_choice: None,
@@ -1193,7 +1212,7 @@ pub async fn create_post_compact_file_attachments(
         .iter()
         .filter(|(filename, _)| {
             !should_exclude_from_post_compact_restore(filename, None)
-                && !preserved_read_paths.contains(&filename.as_str())
+                && !preserved_read_paths.contains(filename)
         })
         .take(max_files)
         .collect();

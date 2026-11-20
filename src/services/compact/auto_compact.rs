@@ -231,14 +231,14 @@ fn build_prefix_overflow_check(
     // messagesEstimate 用 roughTokenCountEstimationForMessages 等价（本地
     // 4 字符/token 的 usage 锚外估算）。
     let messages_estimate = estimate_message_tokens(messages) as i64;
-    Some(detect_prefix_overflow(
+    detect_prefix_overflow(
         usage,
         messages_estimate,
         get_auto_compact_threshold(model),
         snip_tokens_freed,
         Some(document_block_count),
         Some(image_block_count),
-    ))
+    )
 }
 
 /// TS `computeConsecutiveRapidRefills(tracking?)`：官方 kNn
@@ -469,7 +469,13 @@ pub async fn auto_compact_if_needed(
 
     let model = tool_use_context
         .map(|ctx| ctx.options.main_loop_model.clone())
-        .unwrap_or_else(crate::utils::model::model::get_runtime_main_loop_model);
+        .unwrap_or_else(|| {
+            crate::utils::model::model::get_runtime_main_loop_model(
+                crate::types::permissions::PermissionMode::Default,
+                &crate::utils::model::model::get_default_main_loop_model(),
+                false,
+            )
+        });
     let should_compact = should_auto_compact(
         messages,
         &model,
@@ -537,7 +543,7 @@ pub async fn auto_compact_if_needed(
     // 实验：优先尝试会话记忆压缩。
     if let Some(session_memory_result) = try_session_memory_compaction(
         messages,
-        tool_use_context.and_then(|ctx| ctx.agent_id.as_deref()),
+        tool_use_context.and_then(|ctx| ctx.agent_id.as_ref().map(|a| a.0.as_str())),
         Some(recompaction_info.auto_compact_threshold),
     )
     .await
@@ -581,6 +587,7 @@ pub async fn auto_compact_if_needed(
                 compaction_result: Some(compaction_result),
                 consecutive_failures: Some(0), // 成功重置失败计数
                 consecutive_rapid_refills,
+                ..Default::default()
             }
         }
         Err(error) => {

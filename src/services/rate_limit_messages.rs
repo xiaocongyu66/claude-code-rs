@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 
 use crate::utils::auth::{get_subscription_type, is_claude_ai_subscriber, is_overage_provisioning_allowed};
 use crate::utils::intl::get_time_zone;
@@ -375,11 +375,15 @@ fn get_early_warning_text(limits: &ClaudeAiLimits) -> Option<String> {
 
     if let (Some(used), Some(reset_time)) = (used, reset_time.as_deref()) {
         return Some(with_upsell(format!(
-            "You've used {used}% of your {limit_name} · resets {reset_time}"
+            "You've used {used}% of your {} · resets {reset_time}",
+            limit_name.unwrap_or("usage limit")
         )));
     }
     if let Some(used) = used {
-        return Some(with_upsell(format!("You've used {used}% of your {limit_name}")));
+        return Some(with_upsell(format!(
+            "You've used {used}% of your {}",
+            limit_name.unwrap_or("usage limit")
+        )));
     }
 
     let limit_name = if limits.rate_limit_type == Some(RateLimitType::Overage) {
@@ -501,7 +505,7 @@ pub(crate) fn format_reset_time(
         return None;
     }
     let timestamp_ms = (timestamp_in_seconds * 1000.0) as i64;
-    let date = Local.timestamp_opt(timestamp_ms).single()?;
+    let date = Local.timestamp_opt(timestamp_ms, 0).single()?;
     let now = Local::now();
     let minutes = date.minute();
 
@@ -509,7 +513,7 @@ pub(crate) fn format_reset_time(
 
     // TS：minute === 0 时不带分钟；am/pm 小写无前导空格
     let time_fragment = |date: DateTime<Local>| {
-        let (hour_12, is_pm) = date.hour12();
+        let (is_pm, hour_12) = date.hour12();
         let am_pm = if is_pm { "pm" } else { "am" };
         if minutes == 0 {
             format!("{hour_12}{am_pm}")
@@ -584,7 +588,8 @@ fn has_claude_ai_billing_access() -> bool {
         return true;
     }
     // Team/Enterprise：检查 admin / billing 角色
-    let org_role = read_global_config()
+    let global_config = read_global_config();
+    let org_role = global_config
         .get("oauthAccount")
         .and_then(|a| a.get("organizationRole"))
         .and_then(serde_json::Value::as_str);

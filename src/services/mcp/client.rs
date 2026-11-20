@@ -266,10 +266,10 @@ pub trait McpTransport: Send + 'static {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<tokio::sync::mpsc::UnboundedReceiver<JSONRPCMessage>, TransportError>> + Send + '_>>;
 
     /// 发出一条消息。
-    fn send(
-        &self,
-        message: &JSONRPCMessage,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
+    fn send<'a>(
+        &'a self,
+        message: &'a JSONRPCMessage,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + 'a>>;
 
     /// 关闭传输（幂等）。
     fn close(
@@ -713,7 +713,7 @@ pub struct SseTransport {
     http: reqwest::Client,
     static_headers: HashMap<String, String>,
     auth_header_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
-    endpoint: Mutex<Option<String>>,
+    endpoint: Arc<Mutex<Option<String>>>,
     incoming_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<JSONRPCMessage>>>,
     closed: std::sync::atomic::AtomicBool,
 }
@@ -732,7 +732,7 @@ impl SseTransport {
             http,
             static_headers,
             auth_header_provider,
-            endpoint: Mutex::new(None),
+            endpoint: Arc::new(Mutex::new(None)),
             incoming_tx: Mutex::new(None),
             closed: std::sync::atomic::AtomicBool::new(false),
         })
@@ -967,7 +967,7 @@ impl ClientCore {
         match cancel {
             Some(token) => {
                 // 轮询取消令牌（无 Future 适配器；间隔 50ms）
-                while !token.aborted() && !self.closed_flag() {
+                while !token.aborted() && !self.closed_flag().await {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
@@ -978,8 +978,8 @@ impl ClientCore {
         }
     }
 
-    fn closed_flag(&self) -> bool {
-        *self.closed.lock().unwrap_or_else(|e| e.into_inner())
+    async fn closed_flag(&self) -> bool {
+        *self.closed.lock().await
     }
 
     async fn dispatch(&self, message: JSONRPCMessage, out_tx: &tokio::sync::mpsc::UnboundedSender<JSONRPCMessage>) {
@@ -1060,6 +1060,12 @@ pub struct McpClient {
     core: Arc<ClientCore>,
 }
 
+impl std::fmt::Debug for McpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpClient").finish_non_exhaustive()
+    }
+}
+
 impl McpClient {
     /// 执行 initialize 双步握手并返回客户端。
     ///
@@ -1100,7 +1106,7 @@ impl McpClient {
                         }
                         maybe = incoming.recv() => {
                             match maybe {
-                                Some(message) => core.dispatch(message, core.tx.clone()).await,
+                                Some(message) => core.dispatch(message, &core.tx.clone()).await,
                                 None => break,
                             }
                         }
@@ -1110,7 +1116,7 @@ impl McpClient {
                 let _ = transport.close().await;
                 // 驱动退出：标记关闭并拒绝全部 pending
                 {
-                    let mut closed = core.closed.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut closed = core.closed.lock().await;
                     *closed = true;
                 }
                 let mut pending = core.pending.lock().await;
@@ -1344,7 +1350,7 @@ fn get_mcp_auth_cache_path() -> PathBuf {
     PathBuf::from(get_claude_config_home_dir()).join("mcp-needs-auth-cache.json")
 }
 
-static AUTH_CACHE: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+static AUTH_CACHE: std::sync::Mutex<Option<HashMap<String, i64>>> = std::sync::Mutex::new(None);
 
 fn read_mcp_auth_cache() -> HashMap<String, i64> {
     {
@@ -1408,7 +1414,7 @@ pub fn clear_mcp_auth_cache() {
 
 /// 连接缓存 key：`name-<config JSON>`（对齐 TS `getServerCacheKey`）。
 pub fn get_server_cache_key(name: &str, server_ref: &ScopedMcpServerConfig) -> String {
-    format!("{name}-{}", stringify_json(&server_ref.config.to_json_value()))
+    format!("{name}-{}", json_stringify(&server_ref.config.to_json_value()))
 }
 
 /// 连接表项：已连接客户端 + 清理句柄。
@@ -1472,14 +1478,14 @@ impl ConnectionFactory {
                 let transport = StreamableHttpTransport::new(
                     http.url.clone(),
                     headers,
-                    auth_header_provider,
+                    auth_provider,
                 )
                 .map_err(|e| TransportError::Message(e))?;
                 Ok((TransportKind::Http, TransportHandle::Http(Arc::new(transport))))
             }
             McpServerConfig::SSE(sse) => {
                 let transport =
-                    SseTransport::new(sse.url.clone(), headers, auth_header_provider)
+                    SseTransport::new(sse.url.clone(), headers, auth_provider)
                         .map_err(|e| TransportError::Message(e))?;
                 Ok((TransportKind::Sse, TransportHandle::Sse(Arc::new(transport))))
             }
@@ -1508,13 +1514,13 @@ impl ConnectionFactory {
                         .mcp_proxy_path
                         .replace("{server_id}", &proxy.id)
                 );
-                let provider = crate::services::mcp::claudeai_proxy_header_provider();
+                let provider = crate::services::mcp::claudeai::claudeai_proxy_header_provider();
                 let mut static_headers = headers;
                 static_headers.insert(
                     "X-Mcp-Client-Session-Id".to_string(),
                     get_session_id().0,
                 );
-                let transport = StreamableHttpTransport::new(proxy_url, static_headers, provider)
+                let transport = StreamableHttpTransport::new(proxy_url, static_headers, Some(provider))
                     .map_err(|e| TransportError::Message(e))?;
                 Ok((
                     TransportKind::ClaudeAiProxy,
@@ -1576,14 +1582,15 @@ impl McpTransport for TransportHandle {
         }
     }
 
-    fn send(
-        &self,
-        message: &JSONRPCMessage,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>> {
+    fn send<'a>(
+        &'a self,
+        message: &'a JSONRPCMessage,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + 'a>> {
+        let message = message.clone();
         match self {
-            TransportHandle::Stdio(t) => t.send(message),
-            TransportHandle::Http(t) => t.send(message),
-            TransportHandle::Sse(t) => t.send(message),
+            TransportHandle::Stdio(t) => Box::pin(async move { t.send(&message).await }),
+            TransportHandle::Http(t) => Box::pin(async move { t.send(&message).await }),
+            TransportHandle::Sse(t) => Box::pin(async move { t.send(&message).await }),
             TransportHandle::InProcess(t) => Box::pin(async move {
                 t.send(message.clone()).await.map_err(TransportError::Message)
             }),
@@ -1635,7 +1642,7 @@ pub async fn connect_to_server(
     // 缓存命中直接返回（保持缓存项不变，只克隆客户端引用）。
     // 注意：std Mutex guard 不跨 await —— 先克隆 Arc 再锁 tokio Mutex。
     {
-        let cache = CONNECTION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = CONNECTION_CACHE.lock().await;
         let entry = cache.get(&key).cloned();
         drop(cache);
         if let Some(entry) = entry {
@@ -1645,7 +1652,7 @@ pub async fn connect_to_server(
                 let kind = entry.transport_kind;
                 drop(guard);
                 return crate::services::mcp::types::MCPServerConnection::Connected(
-                    build_connected(name, server_ref, client, kind),
+                    build_connected(name, server_ref, client, kind).await,
                 );
             }
         }
@@ -1773,7 +1780,7 @@ pub async fn connect_to_server(
     };
     let entry = Arc::new(tokio::sync::Mutex::new(Some(entry)));
     {
-        let mut cache = CONNECTION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = CONNECTION_CACHE.lock().await;
         cache.insert(key.clone(), entry.clone());
     }
 
@@ -1782,10 +1789,11 @@ pub async fn connect_to_server(
         server_ref,
         client,
         transport_kind,
-    ))
+    )
+    .await)
 }
 
-fn build_connected(
+async fn build_connected(
     name: &str,
     server_ref: ScopedMcpServerConfig,
     client: Arc<McpClient>,
@@ -1857,7 +1865,7 @@ fn error_message_dyn(error: &McpClientError) -> String {
 pub async fn clear_server_cache(name: &str, server_ref: &ScopedMcpServerConfig) {
     let key = get_server_cache_key(name, server_ref);
     let entry = {
-        let mut cache = CONNECTION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = CONNECTION_CACHE.lock().await;
         cache.remove(&key)
     };
     if let Some(entry) = entry {
@@ -1905,7 +1913,7 @@ pub async fn ensure_connected_client(
     }
     let connected = connect_to_server(&client.name, client.config.clone(), None).await;
     match connected {
-        crate::services::mcp::types::MCPServerConnection::Connected(c) => Ok((c, c.client.clone())),
+        crate::services::mcp::types::MCPServerConnection::Connected(c) => Ok((c.clone(), c.client.clone())),
         _ => Err(McpClientError::Closed),
     }
 }
@@ -1918,7 +1926,7 @@ pub fn are_mcp_configs_equal(
     if a.config.type_str() != b.config.type_str() {
         return false;
     }
-    stringify_json(&a.config.to_json_value()) == stringify_json(&b.config.to_json_value())
+    json_stringify(&a.config.to_json_value()) == json_stringify(&b.config.to_json_value())
 }
 
 /// MCP 工具输入编码为 auto-mode 分类器输入。
@@ -2481,7 +2489,7 @@ pub fn transform_content(content: &[ContentBlock], _server_name: &str) -> Value 
 pub fn process_mcp_result(result: &CallToolResult, tool: &str, name: &str) -> Value {
     if let Some(structured) = &result.structured_content {
         let _ = (tool, name);
-        return Value::String(stringify_json(structured));
+        return Value::String(json_stringify(structured));
     }
     transform_content(&result.content, name)
 }
@@ -2764,7 +2772,7 @@ pub async fn setup_sdk_mcp_clients(
             ),
         );
         let transport_ref = &transport;
-        match McpClient::connect(TransportHandle::SdkControl(transport_ref)).await {
+        match McpClient::connect(TransportHandle::SdkControl(transport_ref.clone())).await {
             Ok(client) => {
                 let capabilities = client.capabilities().await;
                 let scoped = ScopedMcpServerConfig::new(

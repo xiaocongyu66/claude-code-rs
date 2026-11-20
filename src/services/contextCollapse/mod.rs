@@ -64,7 +64,7 @@ static ENABLED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// TS `isContextCollapseEnabled()`。
 pub fn is_context_collapse_enabled() -> bool {
-    *ENABLED.lock().unwrap_or(&false)
+    *ENABLED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// TS `subscribe()` — 返回取消订阅句柄（空实现：无存储层可订阅）。

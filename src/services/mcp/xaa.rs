@@ -53,6 +53,12 @@ pub enum XaaError {
     Exchange(#[from] XaaTokenExchangeError),
 }
 
+impl From<String> for XaaError {
+    fn from(message: String) -> Self {
+        XaaError::Message(message)
+    }
+}
+
 /// 敏感 token 字段的日志脱敏正则（对齐 TS `SENSITIVE_TOKEN_RE`）。
 static SENSITIVE_TOKEN_RE: Lazy<Option<Regex>> = Lazy::new(|| {
     Regex::new(r#""(access_token|refresh_token|id_token|assertion|subject_token|client_secret)"\s*:\s*"[^"]*""#).ok()
@@ -575,7 +581,7 @@ pub async fn perform_mcp_xaa_auth(
             &crate::services::mcp::xaa_idp_login::IdpLoginOptions {
                 idp_issuer: idp.issuer.clone(),
                 idp_client_id: idp.client_id.clone(),
-                idp_client_secret,
+                idp_client_secret: idp_client_secret.clone(),
                 callback_port: idp.callback_port.map(|p| p as u16),
                 on_authorization_url: Some(on_authorization_url.clone()),
                 skip_browser_open,
@@ -594,7 +600,7 @@ pub async fn perform_mcp_xaa_auth(
             server_config.config.url().unwrap_or(""),
             &XaaConfig {
                 client_id: client_id.clone(),
-                client_secret,
+                client_secret: client_secret.clone(),
                 idp_client_id: idp.client_id.clone(),
                 idp_client_secret,
                 idp_id_token: id_token,

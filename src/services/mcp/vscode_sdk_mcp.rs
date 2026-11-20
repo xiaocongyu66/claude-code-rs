@@ -25,7 +25,8 @@ struct LogEventNotificationParams {
 }
 
 /// 已注册的 VSCode MCP 客户端引用。
-static VSCODE_MCP_CLIENT: Mutex<Option<Arc<McpClient>>> = Mutex::new(None);
+static VSCODE_MCP_CLIENT: once_cell::sync::Lazy<Mutex<Option<Arc<McpClient>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 /// 通知 VSCode 文件已更新（USER_TYPE=ant 且客户端已注册时）。
 pub async fn notify_vscode_file_updated(

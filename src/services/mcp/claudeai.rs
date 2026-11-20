@@ -82,16 +82,16 @@ async fn fetch_inner() -> HashMap<String, ScopedMcpServerConfig> {
     };
 
     // 直接检查 user:mcp_servers scope（非交互模式 isClaudeAISubscriber 会误判）
-    let has_scope = tokens
-        .scopes
-        .as_deref()
-        .map(|scopes| scopes.iter().any(|s| s == "user:mcp_servers"))
-        .unwrap_or(false);
+    let has_scope = tokens.scopes.iter().any(|s| s == "user:mcp_servers");
     if !has_scope {
         log_for_debugging(
             &format!(
                 "[claudeai-mcp] Missing user:mcp_servers scope (scopes={})",
-                tokens.scopes.as_deref().map(|s| s.join(",")).unwrap_or_else(|| "none".to_string())
+                if tokens.scopes.is_empty() {
+                    "none".to_string()
+                } else {
+                    tokens.scopes.join(",")
+                }
             ),
             DebugLogLevel::Debug,
         );

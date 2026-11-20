@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::services::mcp::client::McpClient;
+use crate::services::mcp::client::{McpClient, McpClientError};
 use crate::services::mcp::types::{
     CompletionResult, ListResourceTemplatesResult, ServerCapabilities, ServerResourceTemplate,
     ScopedMcpServerConfig,
@@ -96,7 +96,7 @@ pub async fn fetch_resource_templates_for_client(
         .client
         .request("resources/templates/list", None)
         .await
-        .and_then(|value| serde_json::from_value(value).map_err(|e| anyhow::anyhow!(e)));
+        .and_then(|value| serde_json::from_value(value).map_err(|e| McpClientError::Decode(e.to_string())));
 
     match result {
         Ok(parsed) => {
@@ -142,7 +142,7 @@ pub async fn clear_resource_templates_cache(server_name: &str) {
     let mut cache = TEMPLATE_CACHE.lock().await;
     let keys: Vec<String> = cache
         .keys()
-        .filter(|key| key == server_name || key.starts_with(&format!("{server_name}::")))
+        .filter(|key| key.as_str() == server_name || key.starts_with(&format!("{server_name}::")))
         .cloned()
         .collect();
     for key in keys {

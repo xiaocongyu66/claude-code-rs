@@ -135,7 +135,7 @@ pub async fn register_elicitation_handler(
                     )
                     .await;
                     match result {
-                        Ok(receiver) => match receiver.await {
+                        Ok(receiver) => match receiver {
                             Ok(result) => Ok(serde_json::to_value(result).unwrap_or_default()),
                             Err(_) => Ok(serde_json::json!({ "action": "cancel" })),
                         },

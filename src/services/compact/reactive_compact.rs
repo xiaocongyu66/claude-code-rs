@@ -18,8 +18,8 @@ pub fn is_reactive_only_mode() -> bool {
     // settings.json: { "compact": { "reactiveOnlyMode": true } }
     //（reactiveOnlyMode 不是 V2 建模字段，落在 CompactionSettings.extra）
     get_compaction_settings()
-        .and_then(|compaction| compaction.extra.get("reactiveOnlyMode"))
-        .and_then(serde_json::Value::as_bool)
+        .and_then(|compaction| compaction.extra.get("reactiveOnlyMode").cloned())
+        .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
 

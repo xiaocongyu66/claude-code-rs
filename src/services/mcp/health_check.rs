@@ -34,7 +34,7 @@ pub const HEALTH_CHECK_FAILURE_THRESHOLD: u32 = 3;
 pub const MCP_HEALTH_CHECK_ENV: &str = "CLAUDE_CODE_MCP_HEALTH_CHECK";
 
 /// 健康探测选项。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct HealthCheckOptions {
     /// ping 间隔（默认 30s）。
     pub interval_ms: Option<u64>,
@@ -46,6 +46,16 @@ pub struct HealthCheckOptions {
     pub on_unhealthy: Option<Arc<dyn Fn(&MCPServerHealth) + Send + Sync>>,
     /// unhealthy→healthy 转换时调用一次。
     pub on_recover: Option<Arc<dyn Fn(&MCPServerHealth) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for HealthCheckOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HealthCheckOptions")
+            .field("interval_ms", &self.interval_ms)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("failure_threshold", &self.failure_threshold)
+            .finish()
+    }
 }
 
 /// 单次 ping 结果（结构化，永不抛错）。

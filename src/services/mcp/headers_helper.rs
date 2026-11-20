@@ -66,7 +66,7 @@ pub async fn get_mcp_headers_from_helper(
                 let error = format!(
                     "Security: headersHelper for MCP server '{server_name}' executed before workspace trust is confirmed."
                 );
-                let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, &error);
+                let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, &*error);
                 log_ant_error("MCP headersHelper invoked before trust check", &err);
                 log_for_debugging(
                     "MCP headersHelper invoked before trust check",

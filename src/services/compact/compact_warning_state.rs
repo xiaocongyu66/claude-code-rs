@@ -24,7 +24,7 @@ impl CompactWarningStore {
 
     /// TS `store.getState()`。
     pub fn get_state(&self) -> bool {
-        *self.state.lock().unwrap_or(&false)
+        self.state.lock().map(|state| *state).unwrap_or(false)
     }
 
     /// TS `store.setState(fn)`：应用新值并通知订阅者。

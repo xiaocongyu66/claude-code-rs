@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -617,7 +617,7 @@ impl FirstPartyEventLoggingExporter {
                     "client_timestamp".into(),
                     Value::String(hr_time_to_rfc3339(log_record.hr_time_ms)),
                 );
-                partial.insert("session_id".into(), Value::String(get_session_id()));
+                partial.insert("session_id".into(), Value::String(get_session_id().to_string()));
                 partial.insert(
                     "additional_metadata".into(),
                     Value::String(base64_encode(
@@ -682,7 +682,13 @@ impl FirstPartyEventLoggingExporter {
             if !additional_metadata.is_empty() {
                 event_data.insert(
                     "additional_metadata".into(),
-                    Value::String(base64_encode(json_stringify_safe(&Value::Object(additional_metadata)).as_bytes())),
+                    Value::String(
+                        base64_encode(
+                            serde_json::to_string(&Value::Object(additional_metadata))
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        ),
+                    ),
                 );
             }
             events.push(FirstPartyEventLoggingEvent {
@@ -727,9 +733,18 @@ impl FirstPartyEventLoggingExporter {
 /// 返回 (skill, plugin, marketplace, 剩余 additional)。
 fn hoist_proto_fields(additional: &Map<String, Value>) -> (Option<String>, Option<String>, Option<String>, Map<String, Value>) {
     let mut rest = additional.clone();
-    let skill_name = rest.remove("_PROTO_skill_name").and_then(Value::as_str).map(str::to_string);
-    let plugin_name = rest.remove("_PROTO_plugin_name").and_then(Value::as_str).map(str::to_string);
-    let marketplace_name = rest.remove("_PROTO_marketplace_name").and_then(Value::as_str).map(str::to_string);
+    let skill_name = match rest.remove("_PROTO_skill_name") {
+        Some(serde_json::Value::String(s)) => Some(s),
+        _ => None,
+    };
+    let plugin_name = match rest.remove("_PROTO_plugin_name") {
+        Some(serde_json::Value::String(s)) => Some(s),
+        _ => None,
+    };
+    let marketplace_name = match rest.remove("_PROTO_marketplace_name") {
+        Some(serde_json::Value::String(s)) => Some(s),
+        _ => None,
+    };
     (skill_name, plugin_name, marketplace_name, rest)
 }
 
