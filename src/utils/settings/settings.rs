@@ -259,7 +259,7 @@ fn settings_to_value(s: &SettingsJson) -> Value {
 
 /// 处理 settings 文件的文件系统错误：ENOENT（断裂符号链接/缺失）→ debug
 /// 日志；其它 → logError。
-fn handle_file_system_error(error: &dyn std::error::Error, path: &str) {
+fn handle_file_system_error(error: &(dyn std::error::Error + 'static), path: &str) {
     if is_enoent(error) {
         log_for_debugging(
             &format!("Broken symlink or missing file encountered for settings.json at path: {path}"),

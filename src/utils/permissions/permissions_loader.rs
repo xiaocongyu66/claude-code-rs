@@ -121,12 +121,9 @@ fn get_settings_for_source_lenient_for_editing_only(source: SettingSource) -> Op
     }
 }
 
-/// `serde_json::Map<String, String>` → `HashMap<String, String>`。
-/// serde_json 只为 `Map<String, Value>` 实现 Clone，需逐项转换。
-fn tool_aliases_to_hashmap(map: &Map<String, String>) -> HashMap<String, String> {
-    map.iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+/// `tool_aliases` 字段已是 `HashMap<String, String>`，直接克隆。
+fn tool_aliases_to_hashmap(map: &HashMap<String, String>) -> HashMap<String, String> {
+    map.clone()
 }
 
 /// 计算规则工具名在该 toolAliases 映射下的别名集合。
@@ -467,8 +464,7 @@ mod tests {
 
     #[test]
     fn tool_aliases_attach_alias_skill_tool_names() {
-        let mut aliases = Map::new();
-        aliases.insert("SkillTool".to_string(), "Skill".to_string());
+        let aliases = HashMap::from([("SkillTool".to_string(), "Skill".to_string())]);
         let data = SettingsJson {
             permissions: Some(PermissionsSettings {
                 allow: Some(vec!["Skill".to_string()]),

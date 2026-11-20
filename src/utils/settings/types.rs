@@ -2415,7 +2415,7 @@ fn parse_extra_known_marketplaces(
                         k,
                         entry_name.unwrap_or("")
                     ),
-                    entry_name.map(|s| Value::String(s.to_string())),
+                    entry_name.map(|s| Value::String(s.to_string())).as_ref(),
                 ));
             }
         }
