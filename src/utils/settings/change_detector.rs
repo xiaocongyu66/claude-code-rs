@@ -193,6 +193,10 @@ pub fn initialize() {
     if get_is_remote_mode() {
         return;
     }
+    // 先在锁外计算 watch targets：get_watch_targets 可能回调 settings →
+    // change_detector（如 is_settings_initialized），持锁调用会不可重入死锁。
+    let targets = get_watch_targets();
+
     let mut guard = DETECTOR.lock().unwrap_or_else(|e| e.into_inner());
     let state = guard.get_or_insert(DetectorState {
         initialized: false,
@@ -216,7 +220,6 @@ pub fn initialize() {
         dispose();
     });
 
-    let targets = get_watch_targets();
     if targets.is_empty() {
         return;
     }

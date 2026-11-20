@@ -989,8 +989,14 @@ mod tests {
             "89abcdef0123456789abcdef0123456789abcdef\n",
         )
         .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(get_cached_branch(), "feature");
+        // watcher 轮询在线程中异步失效缓存：重试等待（CI 负载下周期可能被拉长）
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut branch = get_cached_branch();
+        while branch != "feature" && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            branch = get_cached_branch();
+        }
+        assert_eq!(branch, "feature");
         assert_eq!(get_cached_head(), "89abcdef0123456789abcdef0123456789abcdef");
 
         reset_git_file_watcher();
