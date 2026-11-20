@@ -340,8 +340,8 @@ pub fn truncate_path_middle(path: &str, max_length: usize) -> String {
         return path.to_string();
     }
 
-    // 极小或非正数的边界
-    if max_length <= 0 {
+    // 零边界（max_length 为 usize，无负数）
+    if max_length == 0 {
         return "…".to_string();
     }
 
