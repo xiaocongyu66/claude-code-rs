@@ -36,7 +36,7 @@ pub fn validate_bounded_int_env_var(
         };
     };
 
-    let Ok(parsed) = value.parse::<i64>() else {
+    let Some(parsed) = parse_ts_int(value) else {
         let message = format!("Invalid value \"{}\" (using default: {})", value, default_value);
         log_for_debugging(&format!("{name} {message}"), DebugLogLevel::Debug);
         return EnvVarValidationResult {
@@ -73,6 +73,25 @@ pub fn validate_bounded_int_env_var(
     }
 }
 
+/// 对齐 TS `parseInt(value, 10)`：前导空白 + 可选符号 + 连续数字前缀；
+/// 无数字或溢出时返回 None（等价 parseInt 的 NaN）。
+fn parse_ts_int(value: &str) -> Option<i64> {
+    let s = value.trim_start();
+    let (neg, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    let magnitude: i64 = digits[..end].parse().ok()?;
+    Some(if neg { -magnitude } else { magnitude })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +111,18 @@ mod tests {
         assert_eq!(r2.status, "invalid");
         let r3 = validate_bounded_int_env_var("X", Some("-5"), 10, 100);
         assert_eq!(r3.status, "invalid");
+        let r4 = validate_bounded_int_env_var("X", Some(""), 10, 100);
+        assert_eq!(r4.status, "valid"); // 空串等价未设置
+    }
+
+    #[test]
+    fn ts_parse_int_semantics() {
+        // parseInt 的数字前缀容忍（空串/垃圾 → None）
+        assert_eq!(parse_ts_int("12abc"), Some(12));
+        assert_eq!(parse_ts_int("  42"), Some(42));
+        assert_eq!(parse_ts_int("abc"), None);
+        assert_eq!(parse_ts_int(""), None);
+        assert_eq!(parse_ts_int("9223372036854775808"), None); // 溢出 → NaN
     }
 
     #[test]

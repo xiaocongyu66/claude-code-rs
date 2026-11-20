@@ -177,7 +177,7 @@ pub fn detect_vcs(dir: Option<&str>) -> Vec<String> {
     ];
 
     let mut detected: Vec<String> = Vec::new();
-    let mut push = |v: &str, detected: &mut Vec<String>| {
+    let push = |v: &str, detected: &mut Vec<String>| {
         if !detected.iter().any(|d| d == v) {
             detected.push(v.to_string());
         }
@@ -213,7 +213,7 @@ fn read_proc_version() -> Option<String> {
         Ok(content) => Some(content),
         Err(e) => {
             // 读不到 /proc/version：当作普通 Linux，记日志（对齐 TS）
-            log_error_dyn(&e);
+            log_error_dyn(Box::new(e));
             None
         }
     }
@@ -265,11 +265,9 @@ mod tests {
     #[test]
     fn distro_info_shape() {
         if std::env::consts::OS == "linux" {
-            let info = get_linux_distro_info();
-            assert!(info.is_some());
-            let info = info.unwrap();
-            // 内核版本可能读不到（非 Linux 内核的容器），仅校验结构
-            assert!(info.linux_distro_id.is_none() || info.linux_distro_id.is_some());
+            let info = get_linux_distro_info().expect("linux yields distro info");
+            // 内核版本在容器里可能读不到（空串）；id/version 可缺失，仅校验结构合法
+            assert!(info.linux_kernel.len() <= 256 || info.linux_kernel.is_empty());
         } else {
             assert_eq!(get_linux_distro_info(), None);
         }

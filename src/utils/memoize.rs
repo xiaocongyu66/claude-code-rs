@@ -23,16 +23,11 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::future::Future;
 use std::hash::Hash;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
-
-/// `Pin<Box<dyn Future + Send>>`：项目不引 futures crate，裸指针箱装
-/// future 作为异步闭包返回值类型。
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// 默认缓存生命周期：5 分钟（对齐 TS 的 `5 * 60 * 1000` ms）。
 pub const DEFAULT_CACHE_LIFETIME_MS: u64 = 5 * 60 * 1000;
@@ -106,45 +101,47 @@ where
             // 标记刷新中，防止并行重复刷新
             unlocked(&entry).refreshing = true;
 
+            // 先取出旧值（刷新闭包会 move 走 entry）
+            let stale_value = unlocked(&entry).value.clone();
+
             // 后台 fire-and-forget 刷新（对齐 `Promise.resolve().then(...)`）
             let f = Arc::clone(&self.f);
             let cache = Arc::clone(&self.cache);
             let entry = Arc::clone(&entry);
             let key = key.clone();
-            let _ = thread::Builder::new()
-                .name("memoize-ttl-refresh".into())
-                .spawn(move || {
-                    match f(&key) {
-                        Ok(new_value) => {
-                            let mut guard = unlocked(&cache);
-                            if let Some(current) = guard.get(&key) {
-                                // identity 守卫：clear() 后新写入的条目不被旧结果覆盖
-                                if Arc::ptr_eq(current, &entry) {
-                                    guard.insert(
-                                        key,
-                                        Arc::new(Mutex::new(TtlEntry {
-                                            value: new_value,
-                                            timestamp_ms: now_ms(),
-                                            refreshing: false,
-                                        })),
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            crate::utils::log::log_error_dyn(&*e);
-                            let mut guard = unlocked(&cache);
-                            if let Some(current) = guard.get(&key) {
-                                if Arc::ptr_eq(current, &entry) {
-                                    guard.remove(&key);
-                                }
+            let builder = thread::Builder::new().name("memoize-ttl-refresh".into());
+            let _ = builder.spawn(move || {
+                match f(&key) {
+                    Ok(new_value) => {
+                        let mut guard = unlocked(&cache);
+                        if let Some(current) = guard.get(&key) {
+                            // identity 守卫：clear() 后新写入的条目不被旧结果覆盖
+                            if Arc::ptr_eq(current, &entry) {
+                                guard.insert(
+                                    key,
+                                    Arc::new(Mutex::new(TtlEntry {
+                                        value: new_value,
+                                        timestamp_ms: now_ms(),
+                                        refreshing: false,
+                                    })),
+                                );
                             }
                         }
                     }
-                });
+                    Err(e) => {
+                        crate::utils::log::log_error_dyn(&*e);
+                        let mut guard = unlocked(&cache);
+                        if let Some(current) = guard.get(&key) {
+                            if Arc::ptr_eq(current, &entry) {
+                                guard.remove(&key);
+                            }
+                        }
+                    }
+                }
+            });
 
             // 立即返回旧值
-            return Ok(unlocked(&entry).value.clone());
+            return Ok(stale_value);
         }
 
         Ok(unlocked(&entry).value.clone())
@@ -175,17 +172,18 @@ where
 // ---------------------------------------------------------------------------
 
 /// `memoizeWithTTLAsync` 返回的记忆化函数（异步版）。
-pub struct TtlMemoizedAsync<K, V> {
-    f: Arc<dyn Fn(&K) -> BoxFuture<'static, Result<V, Box<dyn Error + Send + Sync>>> + Send + Sync>,
+pub struct TtlMemoizedAsync<K, V, Fut> {
+    f: Arc<dyn Fn(&K) -> Fut + Send + Sync>,
     cache: Arc<Mutex<HashMap<K, Arc<Mutex<TtlEntry<V>>>>>>,
     in_flight: AsyncMutex<HashMap<K, Arc<AsyncMutex<()>>>>,
     ttl_ms: u64,
 }
 
-impl<K, V> TtlMemoizedAsync<K, V>
+impl<K, V, Fut> TtlMemoizedAsync<K, V, Fut>
 where
     K: Eq + Hash + Clone + Send + 'static,
     V: Clone + Send + 'static,
+    Fut: Future<Output = Result<V, Box<dyn Error + Send + Sync>>> + Send + 'static,
 {
     /// 调用记忆化函数。冷调用时并发去重（共享同一次计算）；过期时
     /// 返回旧值并后台刷新。
@@ -255,9 +253,11 @@ where
     }
 
     /// 清空缓存与 in-flight 表（对齐 TS 的 `cache.clear()`：两者都清）。
+    /// 取锁顺序与 `call` 的身份守卫段一致（in_flight → cache），避免锁序反转。
     pub async fn clear(&self) {
+        let mut guard = self.in_flight.lock().await;
         unlocked(&self.cache).clear();
-        self.in_flight.lock().await.clear();
+        guard.clear();
     }
 
     fn spawn_refresh(&self, key: &K, entry: Arc<Mutex<TtlEntry<V>>>) {
@@ -303,19 +303,15 @@ where
 pub fn memoize_with_ttl_async<K, V, F, Fut>(
     f: F,
     cache_lifetime_ms: u64,
-) -> Arc<TtlMemoizedAsync<K, V>>
+) -> Arc<TtlMemoizedAsync<K, V, Fut>>
 where
     K: Eq + Hash + Clone + Send + 'static,
     V: Clone + Send + 'static,
     F: Fn(&K) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<V, Box<dyn Error + Send + Sync>>> + Send + 'static,
 {
-    let f = Arc::new(move |key: &K| {
-        Box::pin(f(key))
-            as BoxFuture<'static, Result<V, Box<dyn Error + Send + Sync>>>
-    });
     Arc::new(TtlMemoizedAsync {
-        f,
+        f: Arc::new(f),
         cache: Arc::new(Mutex::new(HashMap::new())),
         in_flight: AsyncMutex::new(HashMap::new()),
         ttl_ms: cache_lifetime_ms,
@@ -519,13 +515,13 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let calls2 = Arc::clone(&calls);
-        let m: Arc<TtlMemoizedAsync<String, String>> = memoize_with_ttl_async(
+        let m = memoize_with_ttl_async(
             move |_k: &String| {
                 let calls2 = Arc::clone(&calls2);
-                Box::pin(async move {
+                async move {
                     calls2.fetch_add(1, Ordering::SeqCst);
-                    Ok("done".to_string())
-                })
+                    Ok::<String, Box<dyn Error + Send + Sync>>("done".to_string())
+                }
             },
             1000,
         );

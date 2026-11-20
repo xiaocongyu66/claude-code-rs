@@ -190,7 +190,8 @@ impl StringError {
 }
 
 /// 错误日志后端接口（对齐 TS `ErrorLogSink`）。
-/// 实现见 errorLogSink（尚未转换）；附件挂载前的消息进队列。
+/// 实现见 errorLogSink（尚未转换）；挂载前的消息进队列。
+/// 路径方法返回 `PathBuf`（TS 返回 string；Rust 侧路径用 PathBuf）。
 pub trait ErrorLogSink: Send + Sync {
     fn log_error(&self, error: &(dyn Error + Send + Sync + 'static));
     fn log_mcp_error(&self, server_name: &str, error: &(dyn Error + Send + Sync + 'static));
@@ -712,7 +713,7 @@ mod tests {
             "model": "claude-3",
             "messages": [{"role": "user", "content": "hi"}],
         });
-        capture_api_request(&params, Some("headless"));
+        capture_api_request(&params, Some(&"headless".to_string()));
         // messages 落点不应被修改（仅 repl_main_thread 才捕获）
         assert!(params.get("messages").is_some());
     }
