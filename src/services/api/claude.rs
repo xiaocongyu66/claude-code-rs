@@ -2353,11 +2353,8 @@ pub fn normalize_model_string_for_api(model: &str) -> String {
 
 /// `getCanonicalName` 的最小等价：小写化 + 剥离 `-YYYYMMDD` 日期后缀。
 fn canonical_name(model: &str) -> String {
-    let lower = model.to_ascii_lowercase();
-    match &*STRIP_DATE_RE {
-        Some(re) => re.replace_all(&lower, "").trim().to_string(),
-        None => lower,
-    }
+    // 委托 model.rs 的 TS 等价实现（includes 优先级表），避免正则去后缀留下尾随横杠
+    crate::utils::model::model::first_party_name_to_canonical(model)
 }
 
 fn model_string(key: ModelKey) -> String {
@@ -3042,7 +3039,7 @@ mod tests {
     #[test]
     fn strip_context_tag_and_date() {
         assert_eq!(normalize_model_string_for_api("claude-sonnet-4-5[1m]"), "claude-sonnet-4-5");
-        assert_eq!(canonical_name("claude-sonnet-4-20250514"), "claude-sonnet-4-");
+        assert_eq!(canonical_name("claude-sonnet-4-20250514"), "claude-sonnet-4");
     }
 
     #[test]

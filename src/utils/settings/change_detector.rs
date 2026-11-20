@@ -26,7 +26,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
 
 use crate::bootstrap::state::{get_is_remote_mode, SettingSource};
-use crate::utils::cleanup_registry::register_cleanup;
 use crate::utils::debug::{log_for_debugging, DebugLogLevel};
 use crate::utils::settings::constants::{setting_source_as_str, SETTING_SOURCES};
 use crate::utils::settings::internal_writes::{clear_internal_writes, consume_internal_write};
@@ -34,6 +33,7 @@ use crate::utils::settings::managed_path::get_managed_settings_drop_in_dir;
 use crate::utils::settings::mdm::settings::{get_hkcu_settings, get_mdm_settings, refresh_mdm_settings, set_mdm_settings_cache};
 use crate::utils::settings::settings::get_settings_file_path_for_source;
 use crate::utils::settings::settings_cache::reset_settings_cache;
+use crate::utils::cleanup_registry::{register_cleanup, CleanupRegistration};
 use crate::utils::signal::{Signal, Subscription};
 use crate::utils::slow_operations::json_stringify;
 
@@ -65,6 +65,9 @@ struct DetectorState {
     stop: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
     timing: TimingOverrides,
+    /// register_cleanup 返回的句柄：保活期间清理函数不执行；
+    /// reset/dispose 时摘除，由 Drop 执行（至多一次）。
+    registration: Option<CleanupRegistration>,
 }
 
 static DETECTOR: Mutex<Option<DetectorState>> = Mutex::new(None);
@@ -196,7 +199,6 @@ pub fn initialize() {
     // 先在锁外计算 watch targets：get_watch_targets 可能回调 settings →
     // change_detector（如 is_settings_initialized），持锁调用会不可重入死锁。
     let targets = get_watch_targets();
-
     let mut guard = DETECTOR.lock().unwrap_or_else(|e| e.into_inner());
     let state = guard.get_or_insert(DetectorState {
         initialized: false,
@@ -204,6 +206,7 @@ pub fn initialize() {
         stop: Arc::new(AtomicBool::new(false)),
         handles: Vec::new(),
         timing: TimingOverrides::default(),
+        registration: None,
     });
     if state.initialized || state.disposed {
         return;
@@ -213,12 +216,14 @@ pub fn initialize() {
     // MDM 轮询（注册表/plist 变更）
     start_mdm_poll(state);
 
-    // 优雅退出时清理
+    // 优雅退出时清理：必须保住 registration 句柄，否则其 Drop 会
+    // 立即执行清理闭包 → 持锁调用 dispose() → 不可重入死锁。
     let stop = Arc::clone(&state.stop);
-    register_cleanup(move || {
+    let registration = register_cleanup(move || {
         let _ = &stop;
         dispose();
     });
+    state.registration = Some(registration);
 
     if targets.is_empty() {
         return;
@@ -447,13 +452,19 @@ pub fn reset_for_testing(overrides: Option<TimingOverrides>) {
     }
 
     let mut guard = DETECTOR.lock().unwrap_or_else(|e| e.into_inner());
+    let old = guard.take();
     *guard = Some(DetectorState {
         initialized: false,
         disposed: false,
         stop: Arc::new(AtomicBool::new(false)),
         handles: Vec::new(),
         timing: overrides.unwrap_or_default(),
+        registration: None,
     });
+    drop(guard);
+    // 旧 state（含 register_cleanup 句柄）必须在锁外 drop：
+    // 句柄 Drop 会调用 dispose() 重入 DETECTOR 锁。
+    drop(old);
     clear_internal_writes();
 }
 

@@ -487,9 +487,11 @@ impl GitFileWatcher {
     /// 首次访问缓存时惰性启动（对齐 ensureStarted/start）。
     fn ensure_started(&self) {
         let mut state = unlocked(&self.state);
-        if state.initialized || state.stop {
+        if state.initialized {
             return;
         }
+        // reset() 置位 stop；此處重新启动需清除（stop 仅用于让轮询线程退出）
+        state.stop = false;
         state.initialized = true;
         state.git_dir = resolve_git_dir(None);
         let Some(git_dir) = state.git_dir.clone() else {
@@ -982,7 +984,9 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567"
         );
 
-        // 分支切换：改写 HEAD → 下次 get 重算
+        // 分支切换：改写 HEAD → 下次 get 重算。
+        // 先等待>mtime 粒度（部分文件系统仅 ms 粒度，连续写入的 mtime 可能相同）
+        std::thread::sleep(Duration::from_millis(1200));
         fs::write(dir.join(".git/HEAD"), "ref: refs/heads/feature\n").unwrap();
         fs::write(
             dir.join(".git/refs/heads/feature"),

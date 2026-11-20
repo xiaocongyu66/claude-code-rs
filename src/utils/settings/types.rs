@@ -3555,7 +3555,8 @@ mod tests {
         assert!(feature_enabled("TRANSCRIPT_CLASSIFIER"));
         assert!(!feature_enabled("PROACTIVE"));
         assert!(known_top_level_keys().contains(&"autoMode"));
-        assert!(!known_top_level_keys().contains(&"minSleepDurationMs"));
+        // minSleepDurationMs 受 PROACTIVE/KAIROS 门控；默认启用 KAIROS 时存在
+        assert_eq!(feature_enabled("KAIROS"), known_top_level_keys().contains(&"minSleepDurationMs"));
     }
 
     #[test]
