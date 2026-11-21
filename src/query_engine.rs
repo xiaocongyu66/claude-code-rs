@@ -35,7 +35,7 @@ use crate::services::api::claude::{
 };
 use crate::tool::{
     AgentDefinition, CanUseToolFn, CanUseToolRequest, Command, FileStateCache, GetAppStateFn,
-    HandleElicitationFn, McpServerConnection, SetAppStateFn, SetInProgressToolUseIdsFn,
+    HandleElicitationFn, McpServerConnection, SetAppStateFn,
     StateUpdater, StringSetUpdater, ThinkingConfig, ToolUseContext, ToolUseOptions, Tools,
     UpdateStateFn,
 };

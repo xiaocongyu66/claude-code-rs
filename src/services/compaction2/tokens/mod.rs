@@ -17,7 +17,7 @@ pub use manifest::{
 };
 pub use registry::{
     get_tokenizer_dir, load_manifest, reset_tokenizer_cache, resolve_tokenizer,
-    resolve_tokenizer_by_id, LoadedTokenizer, TokenizerDirEnv,
+    resolve_tokenizer_by_id, LoadedTokenizer,
 };
 pub use tiktoken::{create_tiktoken_tokenizer, TiktokenTokenizer};
 

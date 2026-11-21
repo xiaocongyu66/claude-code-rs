@@ -44,7 +44,6 @@ use tokio::net::TcpListener;
 use crate::constants::oauth::MCP_CLIENT_METADATA_URL;
 use crate::services::mcp::oauth_port::{build_redirect_uri, find_available_port};
 use crate::services::mcp::types::{McpServerConfig, ScopedMcpServerConfig};
-use crate::services::mcp::utils::get_logging_safe_mcp_base_url;
 use crate::utils::env_utils::get_claude_config_home_dir;
 use crate::utils::log::log_mcp_debug;
 

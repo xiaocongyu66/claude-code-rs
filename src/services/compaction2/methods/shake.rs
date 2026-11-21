@@ -87,8 +87,12 @@ pub fn create_shake_method(deps: Option<ShakeMethodDeps>) -> Box<dyn CompactionM
         }
     }
 
+    let (reducer, resolve_threshold_tokens) = match deps {
+        Some(deps) => (deps.reducer, deps.resolve_threshold_tokens),
+        None => (None, None),
+    };
     Box::new(ShakeMethod {
-        reducer: deps.and_then(|deps| deps.reducer),
-        resolve_threshold_tokens: deps.and_then(|deps| deps.resolve_threshold_tokens),
+        reducer,
+        resolve_threshold_tokens,
     })
 }

@@ -232,10 +232,21 @@ pub fn get_file_extension_for_analytics(file_path: &str) -> Option<String> {
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(file_path);
-    let dot = base.rfind('.')?;
-    if dot == 0 {
-        return None; // "." 隐藏文件：无扩展名（extname 返回 ""）
-    }
+    let dot = match base.rfind('.') {
+        Some(0) => {
+            return None; // "." 隐藏文件：无扩展名（extname 返回 ""）
+        }
+        Some(dot) => dot,
+        None => {
+            // 无扩展名时：hash 风格文件名（连字符分段且超长，如
+            // "hash-abcd-12345678901234567890"）同样视为潜在敏感，记为 `other`
+            // （对齐 TS 注释中 hash-based filename 一律记为 other 的意图）。
+            if base.contains('-') && base.len() > MAX_FILE_EXTENSION_LENGTH {
+                return Some("other".to_string());
+            }
+            return None;
+        }
+    };
     let ext = &base[dot + 1..];
     if ext.is_empty() {
         return None;
@@ -786,6 +797,11 @@ pub fn to_1p_event_format(
     env_opt_str!("linux_kernel", env_context.linux_kernel);
     env_opt_str!("vcs", env_context.vcs);
     env_opt_str!("version_base", env_context.version_base);
+    // snake_case 环境字段：is_interactive 布尔化（与 core 同值）
+    env.insert(
+        "is_interactive".into(),
+        Value::Bool(metadata.is_interactive == "true"),
+    );
 
     // 核心字段（snake_case）
     let core = FirstPartyEventLoggingCoreMetadata {

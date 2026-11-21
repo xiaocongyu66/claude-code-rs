@@ -12,3 +12,4 @@ pub mod prevent_sleep;
 pub mod rate_limit_grace;
 pub mod rate_limit_messages;
 pub mod mcp;
+pub mod compaction2;

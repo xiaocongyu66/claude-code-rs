@@ -32,13 +32,13 @@ pub fn resolve_threshold_decision(input: &ThresholdInput) -> ThresholdDecision {
     let percent = input.settings.threshold_percent;
 
     let threshold_tokens = if let Some(fixed) = fixed {
-        if fixed.is_finite() && fixed > 0 {
+        if fixed > 0 {
             std::cmp::min(window_tokens - 1, std::cmp::max(1, fixed))
         } else {
             std::cmp::max(1, window_tokens - reserve_tokens)
         }
     } else if let Some(percent) = percent {
-        if percent.is_finite() && percent > 0 {
+        if percent > 0 {
             let clamped = std::cmp::min(99, std::cmp::max(1, percent));
             std::cmp::max(1, (window_tokens as f64 * (clamped as f64 / 100.0)).floor() as i64)
         } else {

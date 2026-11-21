@@ -72,7 +72,7 @@ static KIMI_NONHAN: Lazy<Regex> = Lazy::new(|| {
     // Kimi 模式的非 Han 段形态：与 KIMI_PATTERN 相同，UPPER_NO_HAN /
     // LOWER_NO_HAN 回退为 UPPER/LOWER（段内无 Han 字符，减法无副作用）。
     compile_or_error(&format!(
-        "{contraction}|[^\r\n\p{{L}}\p{{N}}]?{UPPER}*{LOWER}+{contraction}?|[^\r\n\p{{L}}\p{{N}}]?{UPPER}+{LOWER}*{contraction}?|\p{{N}}{{1,3}}| ?[^\s\p{{L}}\p{{N}}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        "{contraction}|[^\\r\\n\\p{{L}}\\p{{N}}]?{UPPER}*{LOWER}+{contraction}?|[^\\r\\n\\p{{L}}\\p{{N}}]?{UPPER}+{LOWER}*{contraction}?|\\p{{N}}{{1,3}}| ?[^\\s\\p{{L}}\\p{{N}}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         contraction = CONTRACTION_CI
     ))
 });

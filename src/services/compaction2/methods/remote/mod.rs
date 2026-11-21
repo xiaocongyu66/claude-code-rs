@@ -13,9 +13,14 @@
 //!
 //! 可用性刻意保守：`CCH_REMOTE_COMPACTION=1` 才开启，未知 gateway 永不可用。
 
+pub mod anthropic;
+pub mod bedrock;
+pub mod openai;
+pub mod transport;
+
 use std::collections::HashMap;
 
-use crate::services::compact::{uuid_v4, Message, SystemMessage};
+use crate::services::compact::{uuid_v4, Content, Message, SystemMessage};
 use crate::services::compaction2::contracts::{
     CompactionContext, CompactionMethod, CompactionMethodName, CompactionOutcome, CutPoint,
 };
@@ -57,10 +62,10 @@ pub enum RemoteLaneResult {
 }
 
 /// TS `RemoteLaneTransport`。
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct RemoteLaneTransport {
     /// 注入的 fetch（生产侧绑定 provider）；未注入则 lane 不可用。
-    pub fetch: Option<RemoteFetch>,
+    pub fetch: Option<Box<dyn RemoteFetch>>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: String,
@@ -186,7 +191,7 @@ fn default_provider() -> Option<ApiProvider> {
 }
 
 fn default_base_url(
-    provider: Option<&ApiProvider>,
+    provider: Option<&str>,
     env: &HashMap<String, Option<String>>,
 ) -> Option<String> {
     let env_value = |key: &str| {
@@ -194,7 +199,7 @@ fn default_base_url(
             .and_then(|value| value.clone())
             .filter(|value| !value.is_empty())
     };
-    match provider.map(String::as_str) {
+    match provider {
         Some("openai") => env_value("OPENAI_BASE_URL"),
         Some("firstParty") | Some("vertex") => env_value("ANTHROPIC_BASE_URL"),
         Some("bedrock") => {
@@ -209,7 +214,7 @@ fn default_base_url(
 }
 
 fn resolve_api_key(
-    provider: Option<&ApiProvider>,
+    provider: Option<&str>,
     env: &HashMap<String, Option<String>>,
 ) -> Option<String> {
     let env_value = |key: &str| {
@@ -217,7 +222,7 @@ fn resolve_api_key(
             .and_then(|value| value.clone())
             .filter(|value| !value.is_empty())
     };
-    match provider.map(String::as_str) {
+    match provider {
         Some("openai") => env_value("OPENAI_API_KEY"),
         Some("firstParty") | Some("vertex") => env_value("ANTHROPIC_API_KEY"),
         _ => None,
@@ -265,7 +270,7 @@ fn resolve_remote(
         .or_else(|| resolve_api_key(provider.as_deref(), &env));
 
     let mut lane = None;
-    match provider.map(String::as_str) {
+    match provider.as_deref() {
         Some("openai") => {
             if is_openai_compaction_lane_available(
                 &ctx.model,
@@ -276,7 +281,7 @@ fn resolve_remote(
             }
         }
         Some("firstParty") | Some("vertex") => {
-            let provider_str = provider.as_deref().map(String::as_str).unwrap_or("");
+            let provider_str = provider.as_deref().unwrap_or("");
             if is_anthropic_compaction_lane_available(
                 provider_str,
                 &ctx.model,
@@ -362,7 +367,7 @@ pub fn compute_remote_cut(ctx: &CompactionContext) -> RemoteCut {
     // 渲染；把切点回拉到调用之前。
     while index > 0
         && index < messages.len()
-        && is_tool_result_message(&messages[index])
+        && is_tool_result_message(messages.get(index))
     {
         index -= 1;
     }
@@ -470,7 +475,7 @@ pub fn create_remote_method(deps: Option<RemoteMethodDeps>) -> Box<dyn Compactio
                     .deps
                     .as_ref()
                     .and_then(|deps| deps.fetch.as_ref())
-                    .map(|fetch| fetch as &dyn RemoteFetch)
+                    .map(|fetch| fetch.as_ref() as &dyn RemoteFetch)
                 else {
                     return CompactionOutcome::Skipped {
                         method: CompactionMethodName::Remote,
@@ -533,13 +538,12 @@ pub fn create_remote_method(deps: Option<RemoteMethodDeps>) -> Box<dyn Compactio
                     },
                     RemoteLaneResult::Success(success) => {
                         let threshold = ctx.settings.threshold_tokens.unwrap_or(0);
+                        let tokens_saved =
+                            std::cmp::max(0, cut_point.tokens_before - tokens_after);
                         CompactionOutcome::Compacted {
                             method: CompactionMethodName::Remote,
                             cut_point,
-                            tokens_saved: std::cmp::max(
-                                0,
-                                cut_point.tokens_before - tokens_after,
-                            ),
+                            tokens_saved,
                             headroom_tokens: if threshold > 0 {
                                 threshold - tokens_after
                             } else {

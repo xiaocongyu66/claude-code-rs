@@ -20,6 +20,21 @@ pub enum TokenizerFormat {
     Hf,
 }
 
+impl TokenizerFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenizerFormat::Tiktoken => "tiktoken",
+            TokenizerFormat::Hf => "hf",
+        }
+    }
+}
+
+impl std::fmt::Display for TokenizerFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// TS `TokenizerFamily`。
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenizerFamily {
@@ -273,7 +288,8 @@ static QWEN_LETTERS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\[\\p\{L\}\\p\{M\}\]\+").unwrap_or_else(|_| Regex::new("$^").unwrap())
 });
 static QWEN_DIGITS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\\p\{N\}(?!\{)").unwrap_or_else(|_| Regex::new("$^").unwrap())
+    // rust regex 无 look-around：去掉 (?!\{)，偶尔多匹配 `\p{N}{…}` 形式可接受
+    Regex::new(r"\\p\{N\}").unwrap_or_else(|_| Regex::new("$^").unwrap())
 });
 static O200K_CLASS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\[\\p\{Lu\}\\p\{Lt\}\\p\{Lm\}\\p\{Lo\}\\p\{M\}\]")

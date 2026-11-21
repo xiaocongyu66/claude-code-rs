@@ -8,6 +8,8 @@
 //! 语义对齐：类型与常量逐条搬运；`Message` 使用 `services::compact` 的
 //! 鸭子类型模型（TS 侧共用 `types/message.ts`）。
 
+use once_cell::sync::Lazy;
+
 use crate::services::compact::Message;
 
 /// TS `TriggerReason`。
@@ -102,8 +104,12 @@ pub struct CompactionSettings {
 }
 
 /// TS `DEFAULT_COMPACTION_SETTINGS`。
-pub const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = CompactionSettings {
-    method_order: DEFAULT_METHOD_ORDER,
+///
+/// `method_order` 是 `Vec`（const 无法分配），用 `Lazy` 提供等价的
+/// 全局只读值；`Lazy` 会 deref 到 `CompactionSettings`，`clone()` /
+/// 字段访问与 const 用法一致。
+pub static DEFAULT_COMPACTION_SETTINGS: Lazy<CompactionSettings> = Lazy::new(|| CompactionSettings {
+    method_order: DEFAULT_METHOD_ORDER.to_vec(),
     keep_recent_tokens: 20_000,
     reserve_tokens: None,
     threshold_tokens: None,
@@ -114,7 +120,7 @@ pub const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = CompactionSettings {
     idle_enabled: false,
     idle_threshold_tokens: 200_000,
     idle_timeout_seconds: 300,
-};
+});
 
 const DEFAULT_METHOD_ORDER: [CompactionMethodName; 5] = [
     CompactionMethodName::Remote,

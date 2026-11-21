@@ -102,15 +102,16 @@ impl InProcessTransport {
 ///
 /// 返回 `[client_transport, server_transport]`：在一侧 send 的消息到达
 /// 另一侧接收端；任一侧 close 触发双方 onclose。
-pub fn create_linked_transport_pair() -> (Arc<InProcessTransport>, Arc<InProcessTransport>) {
+pub async fn create_linked_transport_pair() -> (Arc<InProcessTransport>, Arc<InProcessTransport>) {
     let (tx_for_a, rx_of_a) = mpsc::unbounded_channel::<JSONRPCMessage>();
     let (tx_for_b, rx_of_b) = mpsc::unbounded_channel::<JSONRPCMessage>();
 
     let a = Arc::new(InProcessTransport::new(rx_of_a, tx_for_b));
     let b = Arc::new(InProcessTransport::new(rx_of_b, tx_for_a));
 
-    *a.peer.blocking_lock() = Some(b.clone());
-    *b.peer.blocking_lock() = Some(a.clone());
+    // 纯 async 锁：`blocking_lock` 会在 tokio 运行时线程上 panic
+    *a.peer.lock().await = Some(b.clone());
+    *b.peer.lock().await = Some(a.clone());
 
     (a, b)
 }
@@ -130,7 +131,7 @@ mod tests {
 
     #[tokio::test]
     async fn delivers_to_peer_and_closes_both() {
-        let (a, b) = create_linked_transport_pair();
+        let (a, b) = create_linked_transport_pair().await;
         let mut rx_b = b.start().await.unwrap();
 
         a.send(notification("ping")).await.unwrap();

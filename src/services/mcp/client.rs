@@ -41,7 +41,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -53,9 +52,9 @@ use crate::services::mcp::completions::{self, CompletionConnection};
 use crate::services::mcp::mcp_string_utils::build_mcp_tool_name;
 use crate::services::mcp::normalization::normalize_name_for_mcp;
 use crate::services::mcp::types::{
-    error_codes, CallToolResult, ContentBlock, ElicitParams, JSONRPCError, JSONRPCMessage,
+    error_codes, CallToolResult, ContentBlock, JSONRPCError, JSONRPCMessage,
     JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, ListPromptsResult, ListResourcesResult,
-    ListToolsResult, McpError, McpTool, ServerCapabilities, ServerInfo, ServerResource,
+    ListToolsResult, McpError, ServerCapabilities, ServerInfo, ServerResource,
     ScopedMcpServerConfig,
 };
 use crate::utils::abort_controller::CancellationToken;
@@ -1934,7 +1933,19 @@ pub fn mcp_tool_input_to_auto_classifier_input(input: &Value, tool_name: &str) -
     match input.as_object() {
         Some(obj) if !obj.is_empty() => obj
             .iter()
-            .map(|(k, v)| format!("{k}={v}"))
+            .map(|(k, v)| {
+                // TS `String(input[k])`：字符串取原值，其它类型按字面序列化
+                let value = match v {
+                    Value::String(s) => s.clone(),
+                    _ => v.to_string(),
+                };
+                // 含空白的值加 shell 式双引号，避免键值边界歧义
+                if value.chars().any(char::is_whitespace) {
+                    format!("{k}=\"{value}\"")
+                } else {
+                    format!("{k}={value}")
+                }
+            })
             .collect::<Vec<_>>()
             .join(" "),
         _ => tool_name.to_string(),

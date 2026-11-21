@@ -19,8 +19,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use once_cell::sync::Lazy;
-
 use super::datadog::track_datadog_event;
 use super::first_party_event_logger::{log_event_to_1p, should_sample_event};
 use super::growthbook::check_statsig_feature_gate_cached_may_be_stale;

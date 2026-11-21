@@ -13,7 +13,7 @@ use once_cell::sync::Lazy;
 
 use crate::services::compaction2::tokens::hf_tokenizer::create_hf_tokenizer;
 use crate::services::compaction2::tokens::manifest::{
-    parse_manifest, select_manifest_entry, ManifestEntry, TokenizerManifest,
+    parse_manifest, select_manifest_entry, ManifestEntry, TokenizerFormat, TokenizerManifest,
 };
 use crate::services::compaction2::tokens::tiktoken::{
     create_tiktoken_tokenizer, PretokenizerName,
@@ -107,8 +107,8 @@ fn load_entry(dir: &Path, entry: &ManifestEntry) -> Option<Arc<dyn LoadedTokeniz
     }
     let content = fs::read_to_string(&canonical).ok()?;
 
-    let loaded: Option<Box<dyn LoadedTokenizer>> = match entry.format.as_str() {
-        "hf" => create_hf_tokenizer(&entry.id, &content)
+    let loaded: Option<Box<dyn LoadedTokenizer>> = match entry.format {
+        TokenizerFormat::Hf => create_hf_tokenizer(&entry.id, &content)
             .ok()
             .map(|tokenizer| Box::new(tokenizer) as Box<dyn LoadedTokenizer>),
         _ => {

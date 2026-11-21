@@ -344,10 +344,10 @@ pub fn build_anthropic_compaction_request(
     if let Some(system) = input.system {
         body.insert("system".to_string(), Value::String(system.to_string()));
     }
-    if let Some(tools) = input.tools
-        && !tools.is_empty()
-    {
-        body.insert("tools".to_string(), Value::Array(tools.to_vec()));
+    if let Some(tools) = input.tools {
+        if !tools.is_empty() {
+            body.insert("tools".to_string(), Value::Array(tools.to_vec()));
+        }
     }
     if input.vertex {
         body.insert(
@@ -400,7 +400,7 @@ fn parse_compaction_block(candidate: &serde_json::Map<String, Value>) -> Option<
         Some(Value::Array(items)) => Some(
             items
                 .iter()
-                .filter(Value::is_object)
+                .filter(|item| item.is_object())
                 .cloned()
                 .collect::<Vec<_>>(),
         ),
@@ -462,16 +462,16 @@ pub fn parse_anthropic_compaction_events(events: &[Value]) -> Option<AnthropicCo
                     && (block_index.is_none()
                         || record.get("index").and_then(Value::as_i64) == block_index) =>
             {
-                if let Some(delta) = record.get("delta").and_then(record_of)
-                    && delta.get("type").and_then(Value::as_str) == Some("text_delta")
-                {
-                    if let (Some(block), Some(text)) = (
-                        block.as_ref(),
-                        delta.get("text").and_then(Value::as_str),
-                    ) {
-                        let mut merged = block.clone();
-                        merged.content.push_str(text);
-                        block = Some(merged);
+                if let Some(delta) = record.get("delta").and_then(record_of) {
+                    if delta.get("type").and_then(Value::as_str) == Some("text_delta") {
+                        if let (Some(current), Some(text)) = (
+                            block.as_ref(),
+                            delta.get("text").and_then(Value::as_str),
+                        ) {
+                            let mut merged = current.clone();
+                            merged.content.push_str(text);
+                            block = Some(merged);
+                        }
                     }
                 }
             }

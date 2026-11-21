@@ -92,7 +92,7 @@ pub async fn evaluate_overflow_trigger(input: &OverflowInput<'_>) -> TriggerDeci
                 reason: format!("payload-rejection: {}", payload.reason),
                 threshold,
                 promotion: None,
-                payload: payload.clone(),
+                payload: Some(payload.clone()),
             };
         }
     }

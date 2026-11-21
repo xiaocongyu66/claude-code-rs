@@ -35,10 +35,10 @@ pub fn resolve_method_order(order: Option<&[String]>) -> Vec<CompactionMethodNam
     };
     let mut resolved: Vec<CompactionMethodName> = Vec::new();
     for entry in source {
-        if let Some(method) = is_compaction_method_name(&entry)
-            && !resolved.contains(&method)
-        {
-            resolved.push(method);
+        if let Some(method) = is_compaction_method_name(&entry) {
+            if !resolved.contains(&method) {
+                resolved.push(method);
+            }
         }
     }
     if resolved.is_empty() {

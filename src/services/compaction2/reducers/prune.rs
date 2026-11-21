@@ -518,7 +518,7 @@ pub fn prune_tool_outputs(
 
     let tool_uses = collect_tool_uses_by_id(messages);
     let superseded = collect_superseded(messages, &tool_uses, config, count_tokens, &HashSet::new());
-    let superseded_keys: HashSet<(usize, usize)> = supersended
+    let superseded_keys: HashSet<(usize, usize)> = superseded
         .iter()
         .map(|candidate| candidate_key(candidate.message_index, candidate.block_index))
         .collect();

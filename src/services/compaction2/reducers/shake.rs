@@ -308,10 +308,10 @@ pub fn collect_shake_regions(
                     continue;
                 }
                 let tool_call = tool_uses.get(&block.tool_use_id);
-                if is_protected_tool_result(block, tool_call, &config.protected_tools) {
+                if is_protected_tool_result(&block, tool_call, &config.protected_tools) {
                     continue;
                 }
-                let Some(text) = get_tool_result_text(block) else {
+                let Some(text) = get_tool_result_text(&block) else {
                     continue;
                 };
                 regions.push(ShakeRegion::ToolResult(ToolResultShakeRegion {
@@ -320,7 +320,8 @@ pub fn collect_shake_regions(
                     tool_use_id: block.tool_use_id.clone(),
                     tokens: count_tokens(&text),
                     original_text: text,
-                    label: get_tool_name(block, tool_call).unwrap_or_else(|| "tool".to_string()),
+                    label: get_tool_name(&block, tool_call)
+                        .unwrap_or_else(|| "tool".to_string()),
                 }));
             }
             // 工具结果消息不再扫围栏块（结果文本整体已是一个区域）。
@@ -336,14 +337,14 @@ pub fn collect_shake_regions(
         };
         match content {
             Content::Text(text) => {
-                push_block_regions(regions, i, -1, text, count_tokens, config, typ);
+                push_block_regions(&mut regions, i, -1, text, count_tokens, config, typ);
             }
             Content::Blocks(blocks) => {
                 for (block_index, block) in blocks.iter().enumerate() {
                     if block.get("type").and_then(Value::as_str) == Some("text") {
                         if let Some(text) = block.get("text").and_then(Value::as_str) {
                             push_block_regions(
-                                regions,
+                                &mut regions,
                                 i,
                                 block_index as isize,
                                 text,

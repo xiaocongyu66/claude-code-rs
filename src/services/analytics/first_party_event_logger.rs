@@ -33,7 +33,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::bootstrap::state::get_session_id;
 use crate::utils::debug::{log_for_debugging, DebugLogLevel};
 use crate::utils::platform::{get_platform, get_wsl_version, Platform};
 

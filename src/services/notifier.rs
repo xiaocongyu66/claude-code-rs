@@ -363,7 +363,7 @@ fn find_key_value_dict(xml: &str, key: &str) -> Option<std::ops::Range<usize>> {
             _ => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(body_start..body_start + next_close);
+                    return Some(body_start..body_start + cursor + next_close);
                 }
                 cursor += next_close + "</dict>".len();
             }

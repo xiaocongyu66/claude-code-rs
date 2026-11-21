@@ -74,10 +74,10 @@ pub fn is_bedrock_compaction_lane_available(
     if region.trim().is_empty() {
         return false;
     }
-    if let Some(env) = env
-        && !is_bedrock_compaction_enabled(env)
-    {
-        return false;
+    if let Some(env) = env {
+        if !is_bedrock_compaction_enabled(env) {
+            return false;
+        }
     }
     supports_bedrock_converse_compaction(model)
 }
@@ -167,10 +167,10 @@ pub fn to_bedrock_converse_messages(messages: &[Message]) -> BedrockConverseMapp
                 role: &str,
                 block: BedrockConverseContentBlock| {
         // Converse 期望角色交替；合并同角色相邻消息。
-        if let Some(last) = converted.last_mut()
-            && last.role == role
-        {
-            last.content.push(block);
+        if converted.last_mut().map_or(false, |last| last.role == role) {
+            if let Some(last) = converted.last_mut() {
+                last.content.push(block);
+            }
         } else {
             converted.push(BedrockConverseMessage {
                 role: role.to_string(),
@@ -519,14 +519,14 @@ pub async fn run_bedrock_compaction_lane(
     let request_future = fetch.fetch(&endpoint, init);
     let outcome = tokio::time::timeout(Duration::from_millis(timeout_ms), request_future).await;
     let response = match outcome {
-        Ok(result) => result.map_err(|error| error)?,
+        Ok(result) => match result {
+            Ok(response) => response,
+            Err(error) => return Err(error),
+        },
         Err(_) => {
-            return Err(format!(
-                "Bedrock compaction timed out after {timeout_ms}ms"
-            ))
+            return Err(format!("Bedrock compaction timed out after {timeout_ms}ms"))
         }
     };
-    let response = response.map_err(|error| error)?;
     if !response.ok {
         let detail = {
             let text = response.text.trim();
@@ -549,12 +549,12 @@ pub async fn run_bedrock_compaction_lane(
     let stop_reason = payload.get("stopReason").and_then(Value::as_str);
     // 截断（max_tokens）或被过滤（content_filtered、guardrail_intervened）
     // 的生成不是可用摘要，即使返回文本非空：降级到下一个方法。
-    if let Some(stop_reason) = stop_reason
-        && !SUCCESSFUL_STOP_REASONS.contains(&stop_reason)
-    {
-        return Err(format!(
-            "Bedrock Converse compaction stopped with reason \"{stop_reason}\""
-        ));
+    if let Some(stop_reason) = stop_reason {
+        if !SUCCESSFUL_STOP_REASONS.contains(&stop_reason) {
+            return Err(format!(
+                "Bedrock Converse compaction stopped with reason \"{stop_reason}\""
+            ));
+        }
     }
     let summary = extract_bedrock_converse_summary(&payload)
         .ok_or("Bedrock Converse compaction returned no summary")?;

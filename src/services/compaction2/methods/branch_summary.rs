@@ -414,7 +414,7 @@ pub fn upsert_file_operations(
     );
     let cleaned = match legacy {
         Ok(legacy) => legacy.replace_all(summary, ""),
-        Err(_) => summary.to_string(),
+        Err(_) => std::borrow::Cow::Borrowed(summary),
     }
     .trim_end()
     .to_string();

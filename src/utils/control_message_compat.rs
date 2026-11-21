@@ -4,7 +4,7 @@
 //! camelCase `requestId` 归一化为 snake_case `request_id`（旧构建缺少
 //! Swift CodingKeys 映射）。snake_case 优先；原地修改并返回原对象。
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// 归一化 `requestId` → `request_id`（含嵌套的 `response` 字段）。
 pub fn normalize_control_message_keys(obj: &mut Value) {

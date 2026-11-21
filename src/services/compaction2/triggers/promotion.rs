@@ -31,7 +31,7 @@ pub fn collect_promotion_candidates(source: &PromotionCandidateSource) -> Vec<Pr
     let mut by_model: HashMap<String, PromotionCandidate> = HashMap::new();
     if let Some(overrides) = &source.window_overrides {
         for (model, window_tokens) in overrides {
-            if model.is_empty() || !window_tokens.is_finite() || *window_tokens <= 0 {
+            if model.is_empty() || *window_tokens <= 0 {
                 continue;
             }
             by_model.insert(
@@ -45,7 +45,7 @@ pub fn collect_promotion_candidates(source: &PromotionCandidateSource) -> Vec<Pr
     }
     if let Some(candidates) = &source.candidates {
         for candidate in candidates {
-            if candidate.model.is_empty() || !candidate.window_tokens.is_finite() || candidate.window_tokens <= 0 {
+            if candidate.model.is_empty() || candidate.window_tokens <= 0 {
                 continue;
             }
             match by_model.get(&candidate.model) {
@@ -73,7 +73,7 @@ pub fn select_promotion(
     current_window: i64,
     candidates: Option<&[PromotionCandidate]>,
 ) -> Option<PromotionCandidate> {
-    if !current_window.is_finite() || current_window <= 0 {
+    if current_window <= 0 {
         return None;
     }
     let candidates = candidates.unwrap_or(&[]);
@@ -82,7 +82,7 @@ pub fn select_promotion(
         if candidate.model.is_empty() || candidate.model == current_model {
             continue;
         }
-        if !candidate.window_tokens.is_finite() || candidate.window_tokens <= current_window {
+        if candidate.window_tokens <= current_window {
             continue;
         }
         match best {

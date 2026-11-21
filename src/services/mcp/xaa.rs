@@ -24,7 +24,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::services::mcp::auth::{
-    get_secure_storage, update_secure_storage, OAuthTokens, OnAuthorizationUrl, PersistedDiscoveryState,
+    get_secure_storage, update_secure_storage, OnAuthorizationUrl, PersistedDiscoveryState,
 };
 use crate::services::mcp::types::ScopedMcpServerConfig;
 use crate::utils::log::log_mcp_debug;
@@ -762,6 +762,6 @@ mod tests {
     #[test]
     fn encodes_bearer_basic_auth() {
         let basic = base64_standard(&format!("{}:{}", url_encode("a b"), url_encode("c:d")));
-        assert_eq!(basic, "YSUyMEI6Yzpk");
+        assert_eq!(basic, "YSUyMGI6YyUzQWQ=");
     }
 }

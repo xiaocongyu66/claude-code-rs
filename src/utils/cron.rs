@@ -367,7 +367,7 @@ fn weekday_at(hour: u32, minute: u32, day_index: u32, utc: bool) -> &'static str
         let now = Local::now();
         let mut utc_dt = utc_today_at(0, 0)
             + chrono::Duration::days(
-                ((day_index as i64 - now.weekday().num_days_from_sunday() as i64 + 7) % 7),
+                (day_index as i64 - now.weekday().num_days_from_sunday() as i64 + 7) % 7,
             );
         utc_dt = utc_dt
             .with_hour(hour)

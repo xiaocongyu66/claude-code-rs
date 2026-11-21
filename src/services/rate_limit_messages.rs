@@ -504,12 +504,14 @@ pub(crate) fn format_reset_time(
     if timestamp_in_seconds <= 0.0 {
         return None;
     }
-    let timestamp_ms = (timestamp_in_seconds * 1000.0) as i64;
-    let date = Local.timestamp_opt(timestamp_ms, 0).single()?;
+    // timestamp_opt 收秒（scheduleTimestamp 一路是秒，勿乘 1000）
+    let timestamp_secs = timestamp_in_seconds as i64;
+    let date = Local.timestamp_opt(timestamp_secs, 0).single()?;
     let now = Local::now();
     let minutes = date.minute();
 
-    let hours_until_reset = (date.timestamp() - now.timestamp()) as f64 / (1000.0 * 60.0 * 60.0);
+    // timestamp() 已是秒，直接除 3600 得小时
+    let hours_until_reset = (date.timestamp() - now.timestamp()) as f64 / 3600.0;
 
     // TS：minute === 0 时不带分钟；am/pm 小写无前导空格
     let time_fragment = |date: DateTime<Local>| {

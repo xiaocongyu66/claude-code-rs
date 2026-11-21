@@ -113,7 +113,7 @@ pub fn translate_hf_pattern(pattern: &str) -> Result<String, String> {
     // 失败——`compile_splitters` 把编译失败视作"不支持该 tokenizer"，
     // 注册表回落 cl100k/adaptive（与 TS 抛错回落同一效果）。
     let intersection =
-        regex::Regex::new(r"\[([^[\]]*)&&\[\^([^[\]]*)\]\]").map_err(|e| e.to_string())?;
+        regex::Regex::new(r"\[([^\[\]]*)&&\[\^([^\[\]]*)\]\]").map_err(|e| e.to_string())?;
     let mut replaced = out;
     loop {
         let (whole, replacement): (String, String) = {
@@ -447,7 +447,7 @@ pub fn create_hf_tokenizer(id: &str, content: &str) -> Result<HfTokenizer, Strin
     }
     let vocab = parse_vocab(model.and_then(|model| model.get("vocab")))?;
     let mut pair_ranks = HashMap::new();
-    for (rank, (left, right)) in parse_merges(model.and_then(|model| model.get("merges"))?
+    for (rank, (left, right)) in parse_merges(model.and_then(|model| model.get("merges")))?
         .into_iter()
         .enumerate()
     {

@@ -134,9 +134,13 @@ pub fn create_soft_method(deps: Option<SoftMethodDeps>) -> Box<dyn CompactionMet
         }
     }
 
+    let (runner, instructions, resolve_threshold_tokens) = match deps {
+        Some(deps) => (Some(deps.runner), deps.instructions, deps.resolve_threshold_tokens),
+        None => (None, None, None),
+    };
     Box::new(SoftMethod {
-        runner: deps.map(|deps| deps.runner),
-        instructions: deps.map(|deps| deps.instructions).unwrap_or(None),
-        resolve_threshold_tokens: deps.and_then(|deps| deps.resolve_threshold_tokens),
+        runner,
+        instructions,
+        resolve_threshold_tokens,
     })
 }

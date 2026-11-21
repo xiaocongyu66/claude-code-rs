@@ -27,7 +27,6 @@
 //! - `utils/http.ts`（getAuthHeaders）与 `utils/config.ts`（trust 已在
 //!   auth.rs 就绪）未完整转换：鉴权头拼装以默认 header 为准。
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -896,7 +895,7 @@ mod tests {
                 map.insert("event_name".into(), json!("tengu_init"));
                 map.insert("event_id".into(), json!("id-1"));
                 map.insert(
-                    "core_metadata",
+                    "core_metadata".to_string(),
                     json!({
                         "model": "claude-sonnet",
                         "sessionId": "sid",

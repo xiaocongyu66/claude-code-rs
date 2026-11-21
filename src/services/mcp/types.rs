@@ -520,6 +520,10 @@ pub fn parse_mcp_server_config(raw: &Value) -> McpServerConfigParse {
 }
 
 /// 解析 `McpJsonConfig`（`{ mcpServers: {...} }`）。
+///
+/// 仅结构错误（根非对象、缺少 `mcpServers`）整体失败；单个 server 不合
+/// schema 时保留原始值，交由 `parse_mcp_config` 逐 server 报错，避免一
+/// 个坏 server 丢弃整个配置（对齐 config.ts 的逐条容错语义）。
 pub fn parse_mcp_json_config(raw: &Value) -> Result<McpJsonConfig, Vec<SchemaParseError>> {
     let obj = raw
         .as_object()
@@ -528,25 +532,10 @@ pub fn parse_mcp_json_config(raw: &Value) -> Result<McpJsonConfig, Vec<SchemaPar
         .get("mcpServers")
         .and_then(Value::as_object)
         .ok_or_else(|| vec![err("mcpServers", "Expected record of server configs")])?;
-    let mut mcp_servers = HashMap::new();
-    for (name, cfg) in servers {
-        let parsed = parse_mcp_server_config(cfg);
-        match parsed.config {
-            Some(_) => {
-                mcp_servers.insert(name.clone(), cfg.clone());
-            }
-            None => {
-                return Err(parsed
-                    .errors
-                    .into_iter()
-                    .map(|e| SchemaParseError {
-                        path: format!("mcpServers.{name}.{}", e.path),
-                        message: e.message,
-                    })
-                    .collect());
-            }
-        }
-    }
+    let mcp_servers = servers
+        .iter()
+        .map(|(name, cfg)| (name.clone(), cfg.clone()))
+        .collect();
     Ok(McpJsonConfig { mcp_servers })
 }
 

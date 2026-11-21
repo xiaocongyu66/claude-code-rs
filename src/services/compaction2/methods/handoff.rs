@@ -54,12 +54,12 @@ pub struct HandoffMethodDeps {
     /// 生成移交文档；由 orchestrator 注入（soft 路径）。
     pub summarize: Option<
         Box<
-            dyn Fn(
-                    &CompactionContext,
-                    &HandoffSummaryRequest,
+            dyn for<'a> Fn(
+                    &'a CompactionContext,
+                    &'a HandoffSummaryRequest,
                 ) -> Pin<
                     Box<
-                        dyn Future<Output = Result<HandoffSummaryValue, String>> + Send + '_,
+                        dyn Future<Output = Result<HandoffSummaryValue, String>> + Send + 'a,
                     >,
                 > + Send
                 + Sync,
@@ -91,11 +91,11 @@ pub fn create_handoff_method(deps: Option<HandoffMethodDeps>) -> Box<dyn Compact
     struct HandoffMethod {
         summarize: Option<
             Box<
-                dyn Fn(
-                        &CompactionContext,
-                        &HandoffSummaryRequest,
+                dyn for<'a> Fn(
+                        &'a CompactionContext,
+                        &'a HandoffSummaryRequest,
                     ) -> Pin<
-                        Box<dyn Future<Output = Result<HandoffSummaryValue, String>> + Send + '_>,
+                        Box<dyn Future<Output = Result<HandoffSummaryValue, String>> + Send + 'a>,
                     > + Send
                     + Sync,
             >,
@@ -185,7 +185,7 @@ pub fn create_handoff_method(deps: Option<HandoffMethodDeps>) -> Box<dyn Compact
 
                 CompactionOutcome::Compacted {
                     method: CompactionMethodName::Handoff,
-                    cut_point: cut.cut_point,
+                    cut_point: cut.cut_point.clone(),
                     tokens_saved: std::cmp::max(
                         0,
                         cut.cut_point.tokens_before - cut.tokens_after,
@@ -203,9 +203,13 @@ pub fn create_handoff_method(deps: Option<HandoffMethodDeps>) -> Box<dyn Compact
         }
     }
 
+    let (summarize, instructions, is_available) = match deps {
+        Some(deps) => (deps.summarize, deps.instructions, deps.is_available),
+        None => (None, None, None),
+    };
     Box::new(HandoffMethod {
-        summarize: deps.and_then(|deps| deps.summarize),
-        instructions: deps.and_then(|deps| deps.instructions),
-        is_available: deps.and_then(|deps| deps.is_available),
+        summarize,
+        instructions,
+        is_available,
     })
 }

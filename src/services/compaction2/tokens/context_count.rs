@@ -55,6 +55,14 @@ pub struct TokenizedMessageCount {
     pub exact: bool,
 }
 
+/// TS `CountMessagesWithTokenizerOptions`。
+#[derive(Debug, Clone, Default)]
+pub struct CountMessagesWithTokenizerOptions {
+    pub provider: Option<String>,
+    /// 测试缝：自定义单块图片/文档计价。
+    pub image_tokens: Option<fn(&Value, &str) -> usize>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ImageSize {
     width: i64,
@@ -538,7 +546,14 @@ pub fn count_context_tokens(
         Some(anchor) => messages[anchor.index + 1..].to_vec(),
         None => messages.to_vec(),
     };
-    let counted = count_messages_with_tokenizer(&tail, model, options);
+    let counted = count_messages_with_tokenizer(
+        &tail,
+        model,
+        &CountMessagesWithTokenizerOptions {
+            provider: options.provider.clone(),
+            image_tokens: options.image_tokens,
+        },
+    );
     let orchestration = std::cmp::max(0, options.orchestration_tokens.unwrap_or(0)) as usize;
     let anchor_tokens = anchor
         .map(|anchor| anchor.tokens.saturating_sub(orchestration))

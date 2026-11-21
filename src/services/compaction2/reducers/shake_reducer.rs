@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use sha2::{Digest, Sha1};
+use sha2::{Digest, Sha256};
 
 use crate::services::compaction2::contracts::CompactionContext;
 use crate::services::compaction2::methods::shake::{ShakeReducer, ShakeReduction};
@@ -16,11 +16,10 @@ use crate::services::compaction2::reducers::shake::{
 };
 use crate::services::compaction2::tokens::estimate_tokens;
 
-/// 自定义卸载函数（Rust 侧以 boxed future 支持 dyn 分发）。
+/// 自定义卸载函数（Rust 侧以同步签名对齐 reducers/shake.rs 的
+/// `shake_messages` 卸载回调）。
 pub type OffloadFn = Box<
-    dyn Fn(&ShakeRegion, &CompactionContext) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>>
-        + Send
-        + Sync,
+    dyn Fn(&ShakeRegion, &CompactionContext) -> Option<String> + Send + Sync,
 >;
 
 /// TS `ShakeReducerOptions`。
@@ -62,7 +61,7 @@ impl ShakeReducer for DefaultReducer {
             }
             Some(ShakeReduction {
                 messages: result.messages,
-                tokens_saved: result.tokens_saved,
+                tokens_saved: result.tokens_saved as i64,
                 warning: None,
             })
         })
@@ -88,7 +87,7 @@ impl ShakeReducer for CustomOffloadReducer {
             }
             Some(ShakeReduction {
                 messages: result.messages,
-                tokens_saved: result.tokens_saved,
+                tokens_saved: result.tokens_saved as i64,
                 warning: None,
             })
         })
@@ -104,7 +103,9 @@ fn default_offload_text(region: &ShakeRegion) -> String {
         ShakeRegion::Block(region) => &region.original_text,
     };
     let content_hash = {
-        let mut hasher = Sha1::new();
+        // TODO(sha2): 仓内 sha2 0.10 未导出 Sha1；语义只要求确定性短摘要，
+        // 用 SHA-256 前 8 字节替代（同输入仍稳定复用既有 artifact）。
+        let mut hasher = Sha256::new();
         hasher.update(original_text.as_bytes());
         let digest = hasher.finalize();
         let mut hex = String::with_capacity(16);

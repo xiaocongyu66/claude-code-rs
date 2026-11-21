@@ -987,7 +987,7 @@ mod tests {
 
     const NOW_MS: u128 = 1_700_000_000_000;
 
-    fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    fn hdrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1012,7 +1012,7 @@ mod tests {
 
     #[test]
     fn missing_status_header_means_limiter_did_not_run() {
-        let headers = headers(&[]);
+        let headers = hdrs(&[]);
         let parsed = parse_unified_grace_headers(&headers, NOW_MS);
         assert!(!parsed.limiter_ran);
         assert!(parsed.zone.is_none());
@@ -1020,7 +1020,7 @@ mod tests {
 
     #[test]
     fn zero_utilizations_mean_no_zone() {
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "allowed"),
             (GRACE_5H_UTILIZATION_HEADER, "0"),
             (GRACE_7D_UTILIZATION_HEADER, "0"),
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn five_hour_zone_selected_when_utilization_present() {
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "allowed"),
             (GRACE_5H_UTILIZATION_HEADER, "0.9"),
             (FIVE_HOUR_RESET_HEADER, "1800000000"),
@@ -1045,7 +1045,7 @@ mod tests {
 
     #[test]
     fn seven_day_zone_when_5h_resets_earlier() {
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "allowed"),
             (GRACE_5H_UTILIZATION_HEADER, "0.5"),
             (FIVE_HOUR_RESET_HEADER, "1700000100"),
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn extra_usage_status_and_in_use_cover_zone() {
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "allowed"),
             (GRACE_5H_UTILIZATION_HEADER, "0.9"),
             (FIVE_HOUR_RESET_HEADER, "1800000000"),
@@ -1067,7 +1067,7 @@ mod tests {
         let parsed = parse_unified_grace_headers(&headers, NOW_MS);
         assert!(parsed.covered);
 
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "allowed"),
             (GRACE_5H_UTILIZATION_HEADER, "0.9"),
             (FIVE_HOUR_RESET_HEADER, "1800000000"),
@@ -1079,7 +1079,7 @@ mod tests {
 
     #[test]
     fn stale_resets_are_dropped() {
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "allowed"),
             (GRACE_5H_UTILIZATION_HEADER, "0.9"),
             (FIVE_HOUR_RESET_HEADER, "1699999999.5"), // now-0.5s：容差门内仍有效
@@ -1087,7 +1087,7 @@ mod tests {
         let parsed = parse_unified_grace_headers(&headers, NOW_MS);
         assert_eq!(parsed.five_hour_reset, Some(1_699_999_999.5));
 
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "allowed"),
             (GRACE_5H_UTILIZATION_HEADER, "0.9"),
             (FIVE_HOUR_RESET_HEADER, "1699999900"),
@@ -1099,7 +1099,7 @@ mod tests {
     #[test]
     fn owed_note_transitions_once_per_window() {
         reset_grace_state_for_tests();
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "rejected"),
             (GRACE_5H_UTILIZATION_HEADER, "0.99"),
             (FIVE_HOUR_RESET_HEADER, "1800000000"),
@@ -1118,7 +1118,7 @@ mod tests {
     #[test]
     fn refusal_after_coverage_re_arms_note() {
         reset_grace_state_for_tests();
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "rejected"),
             (GRACE_5H_UTILIZATION_HEADER, "0.99"),
             (FIVE_HOUR_RESET_HEADER, "1800000000"),
@@ -1140,7 +1140,7 @@ mod tests {
     fn synthetic_rejection_only_after_placed_note() {
         reset_grace_state_for_tests();
         assert!(get_wrap_up_synthetic_rejection(NOW_MS).is_none());
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "rejected"),
             (GRACE_5H_UTILIZATION_HEADER, "0.99"),
             (FIVE_HOUR_RESET_HEADER, "1800000000"),
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn covered_zone_does_not_emit_subagent_note() {
         reset_grace_state_for_tests();
-        let headers = headers(&[
+        let headers = hdrs(&[
             (UNIFIED_STATUS_HEADER, "rejected"),
             (GRACE_5H_UTILIZATION_HEADER, "0.99"),
             (FIVE_HOUR_RESET_HEADER, "1800000000"),
